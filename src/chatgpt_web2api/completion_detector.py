@@ -201,6 +201,7 @@ class DetectorBudgets:
             hard_timeout_seconds=config.detector_hard_timeout_seconds,
         )
 
+
 # Phrases ChatGPT uses in its rate-limit pop-up. Matched case-insensitively
 # against scanned DOM text. Kept narrow to avoid false positives on normal
 # chat content (e.g. a user asking about "rate limits" in a message).
@@ -218,6 +219,32 @@ def is_rate_limited_text(text: str) -> bool:
         return False
     lowered = text.lower()
     return any(phrase in lowered for phrase in _RATE_LIMIT_PHRASES)
+
+
+def _dom_completion_fallback_allowed(
+    *,
+    conv_id_for_check: str,
+    backend_fetch_failed: bool,
+    backend_status: str | None,
+    turn_anchor,
+) -> bool:
+    """Whether a completed DOM row may finish the turn without backend confirmation.
+
+    Existing conversations stay fail-closed because a widened action-button
+    selector can accidentally see a prior turn. A fresh chat is different:
+    Phase 1 already proved that the assistant count moved above the pre-send
+    baseline, so when identity capture was missed there is no prior assistant
+    row in that chat to confuse with the new response. In that narrow case a
+    backend ``not_ready`` result means correlation is not authoritative, and a
+    completed action-row on the new DOM message is safe to use.
+    """
+    if not conv_id_for_check or backend_fetch_failed:
+        return True
+    return (
+        backend_status == "not_ready"
+        and getattr(turn_anchor, "mode", None) == "fresh_chat"
+        and getattr(turn_anchor, "captured_user_message_id", None) is None
+    )
 
 
 class CompletionDetector:
@@ -301,11 +328,10 @@ class CompletionDetector:
 
         A2: ``turn_anchor`` is required. The backend ``end_turn`` completion
         signal is turn-correlated via ``_fetch_end_turn_for_turn`` (tri-state).
-        The DOM
-        ``has_action`` fallback gate is unchanged — ``backend_fetch_failed`` is
-        set ONLY on ``fetch_failed`` (true transport failure), NOT on
-        ``not_ready``/``ambiguous``/``degraded_not_fresh`` (which collapse to
-        ``not_ready`` and must NOT unlock the DOM fallback).
+        DOM fallback remains fail-closed for existing conversations. A fresh
+        chat with a missed identity capture may use the completed action row
+        after the backend has been consulted and returned ``not_ready`` because
+        Phase 1 proves the DOM row is new for this send.
 
         P1 (2026-07-08): ``budgets`` and ``model`` enable the model-aware
         two-state phase-2 machine. When ``budgets`` is None, the legacy
@@ -667,6 +693,7 @@ class CompletionDetector:
             # content) so this can't complete an empty answer. Fetch failures set
             # backend_fetch_failed so the DOM fallback below is unlocked this poll.
             backend_fetch_failed = False
+            backend_status: str | None = None
             if (
                 conv_id_for_check
                 and (last_dom_text or saw_thinking or is_thinking or had_non_text_content)
@@ -678,14 +705,14 @@ class CompletionDetector:
                     # a rich TurnEndResult; collapse_to_end_turn_status maps
                     # it to the detector's tri-state gate. Critical: not_ready/
                     # ambiguous/degraded_not_fresh collapse to not_ready and
-                    # must NOT set backend_fetch_failed (would unlock the DOM
-                    # fallback and risk completing off a prior turn's action
-                    # row — the line-493 gate invariant).
+                    # must NOT normally unlock the DOM fallback for an existing
+                    # conversation, where a prior action row could be stale.
                     end_result = await d._fetch_end_turn_for_turn(
                         conv_id_for_check, turn_anchor,
                         had_non_text_content=had_non_text_content,
                     )
                     status = collapse_to_end_turn_status(end_result)
+                    backend_status = status
                     if status == "complete":
                         # STRICT: end_turn AND usable content. The saw_thinking
                         # unlock lets us CONSULT the backend during thinking, but
@@ -707,7 +734,8 @@ class CompletionDetector:
                             "end_turn fetch failed (status=%s): %s",
                             end_result.status, end_result.diagnostic,
                         )
-                    # else: not_ready — no-op (do NOT set backend_fetch_failed).
+                    # else: not_ready — no-op. The DOM fallback remains locked
+                    # except for the narrow unanchored fresh-chat case below.
                 except AuthExpiredError:
                     # Auth failure must NEVER degrade to DOM fallback.
                     # (PR #39 review finding #2 — the prior broad except
@@ -717,23 +745,37 @@ class CompletionDetector:
                     # Transport/backend failure — treat as fetch_failed so the
                     # DOM fallback unlocks for this poll.
                     backend_fetch_failed = True
+                    backend_status = "fetch_failed"
                     logger.debug("end_turn fetch raised (ignored): %s", e)
 
-            # FALLBACK: DOM action button (has_action). Used ONLY when the primary
-            # backend signal can't run: conv_id is unavailable (before the URL
-            # resolves) OR the backend fetch just failed this poll. When the
-            # backend IS available it is authoritative — a widened has_action
-            # match (depth 8, top-180) can hit a PRIOR turn's action row, so DOM
-            # must not override a live backend that says "not done yet" or that
-            # hasn't been consulted yet due to throttle. Also requires usable
-            # content (same strict guard as the primary) so it can't complete an
-            # empty answer off a stale button.
+            # FALLBACK: DOM action button (has_action). Existing conversations
+            # remain strict: DOM is used only while conv_id is unavailable or
+            # after a real backend transport failure. One additional safe case
+            # exists for a NEW chat where identity capture missed: Phase 1 has
+            # already proven the assistant row is newer than initial_count=0,
+            # so after the backend has been consulted and returns not_ready,
+            # that completed row is authoritative enough to end observation.
             if (
                 has_action
-                and (not conv_id_for_check or backend_fetch_failed)
+                and _dom_completion_fallback_allowed(
+                    conv_id_for_check=conv_id_for_check,
+                    backend_fetch_failed=backend_fetch_failed,
+                    backend_status=backend_status,
+                    turn_anchor=turn_anchor,
+                )
                 and (last_dom_text or had_non_text_content)
             ):
-                logger.info("DOM has_action (fallback completion) — no backend signal")
+                if (
+                    conv_id_for_check
+                    and not backend_fetch_failed
+                    and backend_status == "not_ready"
+                ):
+                    logger.info(
+                        "Fresh-chat DOM completion fallback: identity capture missed; "
+                        "backend correlation not authoritative"
+                    )
+                else:
+                    logger.info("DOM has_action (fallback completion) — no backend signal")
                 break
 
             # ── P1: model-aware two-state stall detection ───────────────────
