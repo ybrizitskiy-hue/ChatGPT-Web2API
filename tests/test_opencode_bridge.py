@@ -1,8 +1,10 @@
+import asyncio
 import json
+import time
 
 import pytest
 
-from chatgpt_web2api.opencode_bridge import OpenCodeBridge, ToolProtocolError
+from chatgpt_web2api.opencode_bridge import OpenCodeBridge, ToolProtocolError, _CachedResult
 
 
 def _tool(name="read"):
@@ -36,7 +38,7 @@ def _payload(content):
     }
 
 
-def test_fingerprint_ignores_stream_transport_mode_and_stream_options():
+def test_fingerprint_ignores_stream_transport_fields():
     base = {"model": "gpt-5", "messages": [{"role": "user", "content": "hello"}]}
     streaming = {**base, "stream": True, "stream_options": {"include_usage": True}}
     nonstreaming = {**base, "stream": False}
@@ -174,12 +176,15 @@ def test_plain_text_completion_is_unchanged_for_auto():
     assert OpenCodeBridge._translate_completion(payload, body) == payload
 
 
-def test_parser_accepts_json_fence_and_string_encoded_arguments():
+def test_parser_accepts_json_fence_string_arguments_and_light_prose():
     fenced = "```json\n{\"__W2A_TOOL_CALL__\":true,\"name\":\"bash\",\"arguments\":{\"cmd\":\"pwd\"}}\n```"
     assert OpenCodeBridge._parse_tool_call(fenced) == ("bash", {"cmd": "pwd"})
 
     encoded = '{"__W2A_TOOL_CALL__":true,"name":"bash","arguments":"{\\"cmd\\":\\"pwd\\"}"}'
     assert OpenCodeBridge._parse_tool_call(encoded) == ("bash", {"cmd": "pwd"})
+
+    prose = 'I will use a tool. {"__W2A_TOOL_CALL__":true,"name":"bash","arguments":{"cmd":"pwd"}} Done.'
+    assert OpenCodeBridge._parse_tool_call(prose) == ("bash", {"cmd": "pwd"})
 
 
 def test_parser_does_not_accept_arbitrary_json():
@@ -193,27 +198,111 @@ def test_sse_tool_call_has_index_and_separate_finish_event():
         body,
     )
     raw = OpenCodeBridge._as_sse(payload).decode()
-    events = [
-        json.loads(line[6:])
-        for line in raw.splitlines()
-        if line.startswith("data: {")
-    ]
+    events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
     first = events[0]["choices"][0]
     tool_delta = first["delta"]["tool_calls"][0]
     assert tool_delta["index"] == 0
+    assert tool_delta["type"] == "function"
     assert tool_delta["function"]["name"] == "read"
     assert first["finish_reason"] is None
     assert events[1]["choices"][0]["finish_reason"] == "tool_calls"
     assert events[1]["choices"][0]["delta"] == {}
+    assert events[-1]["choices"] == []
+    assert events[-1]["usage"]["total_tokens"] == 0
 
 
 def test_sse_plain_text_uses_text_then_stop_boundary():
     raw = OpenCodeBridge._as_sse(_payload("hello")).decode()
-    events = [
-        json.loads(line[6:])
-        for line in raw.splitlines()
-        if line.startswith("data: {")
-    ]
+    events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
     assert events[0]["choices"][0]["delta"] == {"content": "hello"}
     assert events[0]["choices"][0]["finish_reason"] is None
     assert events[1]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_does_not_cancel_shared_turn_and_retry_joins_it():
+    bridge = OpenCodeBridge(cache_ttl=30)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_upstream(body, auth_header):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return _CachedResult(
+            expires_at=time.monotonic() + 30,
+            status=200,
+            headers={},
+            payload=_payload("done"),
+        )
+
+    bridge._do_upstream = fake_upstream
+    body = {"model": "gpt-5", "messages": [{"role": "user", "content": "work"}]}
+    key = bridge._fingerprint(body, "Bearer x")
+
+    first = asyncio.create_task(bridge._get_result(key, body, "Bearer x"))
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    second = asyncio.create_task(bridge._get_result(key, body, "Bearer x"))
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    result = await second
+    assert result.payload["choices"][0]["message"]["content"] == "done"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_turn_is_replayed_without_second_upstream_send():
+    bridge = OpenCodeBridge(cache_ttl=30)
+    calls = 0
+
+    async def fake_upstream(body, auth_header):
+        nonlocal calls
+        calls += 1
+        return _CachedResult(
+            expires_at=time.monotonic() + 30,
+            status=200,
+            headers={},
+            payload=_payload("done"),
+        )
+
+    bridge._do_upstream = fake_upstream
+    body = {"model": "gpt-5", "messages": [{"role": "user", "content": "work"}]}
+    key = bridge._fingerprint(body, None)
+
+    await bridge._get_result(key, body, None)
+    await asyncio.sleep(0)
+    await bridge._get_result(key, body, None)
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_upstream_error_is_not_replayed_from_cache():
+    bridge = OpenCodeBridge(cache_ttl=30)
+    calls = 0
+
+    async def fake_upstream(body, auth_header):
+        nonlocal calls
+        calls += 1
+        return _CachedResult(
+            expires_at=time.monotonic() + 30,
+            status=429,
+            headers={"Retry-After": "1"},
+            payload={"error": {"code": "rate_limit_exceeded"}},
+            cacheable=False,
+        )
+
+    bridge._do_upstream = fake_upstream
+    body = {"model": "gpt-5", "messages": [{"role": "user", "content": "work"}]}
+    key = bridge._fingerprint(body, None)
+
+    await bridge._get_result(key, body, None)
+    await asyncio.sleep(0)
+    await bridge._get_result(key, body, None)
+    assert calls == 2
