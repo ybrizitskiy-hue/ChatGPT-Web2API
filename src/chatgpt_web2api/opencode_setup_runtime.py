@@ -27,9 +27,19 @@ from .opencode_setup_common import (
 
 
 def healthy(url: str, api_key: str | None) -> bool:
+    """Return True only for a usable endpoint.
+
+    Core Web2API deliberately returns HTTP 200 for ``degraded`` and ``broken``
+    health payloads so operators can inspect diagnostics. Treat those states as
+    not ready here; otherwise the launcher could report success while CDP is
+    disconnected. ``starting`` is accepted because core only emits it after
+    Chrome and the driver are connected but before the first request.
+    """
     try:
         status, payload = request_json(url, api_key, 2)
-        return 200 <= status < 400 and payload.get("status") != "broken"
+        if not 200 <= status < 400:
+            return False
+        return payload.get("status") not in {"broken", "degraded"}
     except (OSError, ValueError, json.JSONDecodeError):
         return False
 
@@ -82,7 +92,9 @@ def start(args: argparse.Namespace) -> int:
                 return 1
             print("Starting ChatGPT-Web2API...")
             children.append(spawn(core_command(args.config.expanduser())))
-            if not wait_healthy(f"{upstream}/health", api_key, time.monotonic() + args.startup_timeout):
+            if not wait_healthy(
+                f"{upstream}/health", api_key, time.monotonic() + args.startup_timeout
+            ):
                 print("Web2API did not become reachable. Check the Chrome window and logs.")
                 return 1
         else:
@@ -94,13 +106,16 @@ def start(args: argparse.Namespace) -> int:
             print(f"Web2API model endpoint is unreachable: {exc}")
             return 1
         if status == 401:
-            print("Web2API rejected the configured API key. Restart a local server after setup, or use the remote key.")
+            print(
+                "Web2API rejected the configured API key. Restart a local server after setup, "
+                "or use the remote key."
+            )
             return 1
         if status >= 400:
             print(f"Web2API model endpoint returned HTTP {status}.")
             return 1
 
-        if not healthy(f"{bridge_base}/v1/models", api_key):
+        if not healthy(f"{bridge_base}/bridge/health", api_key):
             if args.no_bridge or not is_loopback(bridge_base):
                 print(f"OpenCode bridge is not reachable at {bridge_base}")
                 return 1
@@ -119,7 +134,9 @@ def start(args: argparse.Namespace) -> int:
             ]
             print("Starting OpenCode bridge...")
             children.append(spawn(command))
-            if not wait_healthy(f"{bridge_base}/bridge/health", api_key, time.monotonic() + 30):
+            if not wait_healthy(
+                f"{bridge_base}/bridge/health", api_key, time.monotonic() + 30
+            ):
                 print("OpenCode bridge did not become reachable.")
                 return 1
         else:
@@ -160,10 +177,18 @@ def doctor(args: argparse.Namespace) -> int:
     key_file = args.key_file.expanduser()
     api_key = read_key(key_file)
     opencode_path = args.opencode_config or (
-        global_opencode_config_path() if args.scope == "global" else project_config_path(args.project_dir.expanduser().resolve())
+        global_opencode_config_path()
+        if args.scope == "global"
+        else project_config_path(args.project_dir.expanduser().resolve())
     )
     checks: list[tuple[str, bool, str]] = []
-    checks.append(("Web2API config", args.core_config.expanduser().exists() or not is_loopback(upstream), str(args.core_config)))
+    checks.append(
+        (
+            "Web2API config",
+            args.core_config.expanduser().exists() or not is_loopback(upstream),
+            str(args.core_config),
+        )
+    )
     checks.append(("API key file", bool(api_key), str(key_file)))
     try:
         config = load_object(opencode_path)
@@ -179,12 +204,20 @@ def doctor(args: argparse.Namespace) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         provider_ok, detail = False, f"{opencode_path}: {exc}"
     checks.append(("OpenCode provider", provider_ok, detail))
-    checks.append(("Web2API health", healthy(f"{upstream}/health", api_key), f"{upstream}/health"))
+    checks.append(
+        ("Web2API health", healthy(f"{upstream}/health", api_key), f"{upstream}/health")
+    )
     try:
         status, _ = request_json(f"{upstream}/v1/models", api_key, 5)
     except (OSError, ValueError, json.JSONDecodeError):
         status = 0
-    checks.append(("Web2API authentication", 200 <= status < 400, f"HTTP {status}" if status else "unreachable"))
+    checks.append(
+        (
+            "Web2API authentication",
+            200 <= status < 400,
+            f"HTTP {status}" if status else "unreachable",
+        )
+    )
     bridge_ok = healthy(f"{bridge_base}/bridge/health", api_key)
     checks.append(("Bridge health", bridge_ok, f"{bridge_base}/bridge/health"))
     models = model_catalog(bridge_base, api_key) if bridge_ok else []
