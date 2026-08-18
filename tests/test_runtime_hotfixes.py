@@ -25,6 +25,42 @@ def test_new_chat_reconciliation_requires_actual_new_chat_route():
     )
 
 
+def test_runtime_composer_selectors_cover_current_editor_families():
+    from chatgpt_web2api import cdp_driver, chatgpt_dom
+
+    selector = runtime_hotfixes.LIVE_COMPOSER_SELECTOR
+    fallback = runtime_hotfixes.LIVE_COMPOSER_FALLBACK_SELECTOR
+
+    assert "data-lexical-editor" in selector
+    assert "contenteditable" in selector
+    assert "ProseMirror" in selector
+    assert "aria-placeholder" in selector
+    assert "wcDTda_fallbackTextarea" in fallback
+    assert chatgpt_dom.COMPOSER_SELECTOR == selector
+    assert cdp_driver.COMPOSER_SELECTOR == selector
+    assert chatgpt_dom.COMPOSER_FALLBACK_SELECTOR == fallback
+    assert cdp_driver.COMPOSER_FALLBACK_SELECTOR == fallback
+
+
+@pytest.mark.asyncio
+async def test_visible_composer_probe_is_visibility_aware(monkeypatch):
+    driver = CDPDriver(tab_mode="adopt")
+    expressions = []
+
+    async def js(expr, timeout=15):
+        expressions.append(expr)
+        return '{"ready": true, "tag": "DIV", "lexical": "true"}'
+
+    monkeypatch.setattr(driver, "_js", js)
+
+    assert await driver._has_composer() is True
+    probe = expressions[-1]
+    assert "getBoundingClientRect" in probe
+    assert "data-lexical-editor" in probe
+    assert "aria-disabled" in probe
+    assert "wcDTda_fallbackTextarea" in probe
+
+
 @pytest.mark.asyncio
 async def test_new_chat_page_navigate_timeout_reconciles_without_second_navigation(monkeypatch):
     driver = CDPDriver(tab_mode="adopt")
@@ -51,6 +87,45 @@ async def test_new_chat_page_navigate_timeout_reconciles_without_second_navigati
 
     assert navigate_calls == 1
     assert driver._current_conv_id is None
+
+
+@pytest.mark.asyncio
+async def test_new_chat_success_without_composer_is_rejected(monkeypatch):
+    """Upstream navigation used to fall through silently after 30 failed probes."""
+    import chatgpt_web2api.cdp_driver as driver_module
+    from chatgpt_web2api.cdp_driver import SendReadinessError
+
+    driver = CDPDriver(tab_mode="adopt")
+    navigate_calls = 0
+
+    async def successful_cdp(method, params=None, timeout=15, _retry=True):
+        nonlocal navigate_calls
+        assert method == "Page.navigate"
+        navigate_calls += 1
+        return {"result": {}}
+
+    async def never_ready_js(expr, timeout=15):
+        if expr == "location.href":
+            return "https://chatgpt.com/?model=auto"
+        return '{"ready": false, "url": "https://chatgpt.com/?model=auto"}'
+
+    async def no_composer():
+        return False
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(driver, "_cdp", successful_cdp)
+    monkeypatch.setattr(driver, "_js", never_ready_js)
+    monkeypatch.setattr(driver, "_has_composer", no_composer)
+    monkeypatch.setattr(driver, "_capture_selector_diagnostic", no_sleep)
+    monkeypatch.setattr(driver_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(runtime_hotfixes, "POST_NAVIGATION_COMPOSER_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(SendReadinessError, match="no visible writable composer"):
+        await driver.navigate_new_chat()
+
+    assert navigate_calls == 1
 
 
 @pytest.mark.asyncio
