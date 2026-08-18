@@ -19,7 +19,6 @@ from .opencode_setup_common import (
     load_object,
     model_catalog,
     normalize_url,
-    origin,
     project_config_path,
     read_key,
     request_json,
@@ -65,10 +64,15 @@ def terminate(process: subprocess.Popen[Any]) -> None:
         process.kill()
 
 
+def bridge_base_url(bridge_url: str) -> str:
+    value = normalize_url(bridge_url, v1=True)
+    return value[: -len("/v1")]
+
+
 def start(args: argparse.Namespace) -> int:
     upstream = normalize_url(args.upstream, v1=False)
     bridge_url = normalize_url(args.bridge_url, v1=True)
-    bridge_origin = origin(bridge_url)
+    bridge_base = bridge_base_url(bridge_url)
     api_key = read_key(args.key_file.expanduser())
     children: list[subprocess.Popen[Any]] = []
     try:
@@ -84,7 +88,11 @@ def start(args: argparse.Namespace) -> int:
         else:
             print(f"Web2API already reachable at {upstream}")
 
-        status, _ = request_json(f"{upstream}/v1/models", api_key, 5)
+        try:
+            status, _ = request_json(f"{upstream}/v1/models", api_key, 5)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Web2API model endpoint is unreachable: {exc}")
+            return 1
         if status == 401:
             print("Web2API rejected the configured API key. Restart a local server after setup, or use the remote key.")
             return 1
@@ -92,11 +100,14 @@ def start(args: argparse.Namespace) -> int:
             print(f"Web2API model endpoint returned HTTP {status}.")
             return 1
 
-        if not healthy(f"{bridge_origin}/v1/models", api_key):
-            if args.no_bridge or not is_loopback(bridge_origin):
-                print(f"OpenCode bridge is not reachable at {bridge_origin}")
+        if not healthy(f"{bridge_base}/v1/models", api_key):
+            if args.no_bridge or not is_loopback(bridge_base):
+                print(f"OpenCode bridge is not reachable at {bridge_base}")
                 return 1
-            parsed = urllib.parse.urlparse(bridge_origin)
+            parsed = urllib.parse.urlparse(bridge_url)
+            if parsed.path.rstrip("/") != "/v1":
+                print("A locally managed bridge URL cannot contain a path prefix before /v1.")
+                return 2
             command = self_command() + [
                 "serve",
                 "--upstream",
@@ -108,11 +119,11 @@ def start(args: argparse.Namespace) -> int:
             ]
             print("Starting OpenCode bridge...")
             children.append(spawn(command))
-            if not wait_healthy(f"{bridge_origin}/v1/models", api_key, time.monotonic() + 30):
+            if not wait_healthy(f"{bridge_base}/bridge/health", api_key, time.monotonic() + 30):
                 print("OpenCode bridge did not become reachable.")
                 return 1
         else:
-            print(f"OpenCode bridge already reachable at {bridge_origin}")
+            print(f"OpenCode bridge already reachable at {bridge_base}")
 
         if args.launch_opencode:
             executable = shutil.which("opencode")
@@ -145,7 +156,7 @@ def start(args: argparse.Namespace) -> int:
 def doctor(args: argparse.Namespace) -> int:
     upstream = normalize_url(args.upstream, v1=False)
     bridge_url = normalize_url(args.bridge_url, v1=True)
-    bridge_origin = origin(bridge_url)
+    bridge_base = bridge_base_url(bridge_url)
     key_file = args.key_file.expanduser()
     api_key = read_key(key_file)
     opencode_path = args.opencode_config or (
@@ -157,7 +168,13 @@ def doctor(args: argparse.Namespace) -> int:
     try:
         config = load_object(opencode_path)
         providers = config.get("provider")
-        provider_ok = isinstance(providers, dict) and args.provider_id in providers
+        provider = providers.get(args.provider_id) if isinstance(providers, dict) else None
+        options = provider.get("options") if isinstance(provider, dict) else None
+        provider_ok = (
+            isinstance(provider, dict)
+            and isinstance(options, dict)
+            and normalize_url(str(options.get("baseURL", "")), v1=True) == bridge_url
+        )
         detail = str(opencode_path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         provider_ok, detail = False, f"{opencode_path}: {exc}"
@@ -168,9 +185,9 @@ def doctor(args: argparse.Namespace) -> int:
     except (OSError, ValueError, json.JSONDecodeError):
         status = 0
     checks.append(("Web2API authentication", 200 <= status < 400, f"HTTP {status}" if status else "unreachable"))
-    bridge_ok = healthy(f"{bridge_origin}/v1/models", api_key)
-    checks.append(("Bridge health", bridge_ok, f"{bridge_origin}/v1/models"))
-    models = model_catalog(bridge_origin, api_key) if bridge_ok else []
+    bridge_ok = healthy(f"{bridge_base}/bridge/health", api_key)
+    checks.append(("Bridge health", bridge_ok, f"{bridge_base}/bridge/health"))
+    models = model_catalog(bridge_base, api_key) if bridge_ok else []
     checks.append(("Model catalog", bool(models), ", ".join(models) if models else bridge_url))
 
     print("OpenCode integration doctor")
@@ -180,13 +197,17 @@ def doctor(args: argparse.Namespace) -> int:
 
 
 def serve(args: argparse.Namespace) -> int:
-    os.environ["W2A_UPSTREAM"] = normalize_url(args.upstream, v1=False)
-    os.environ["W2A_OPENCODE_HOST"] = args.host
-    os.environ["W2A_OPENCODE_PORT"] = str(args.port)
-    os.environ["W2A_OPENCODE_CACHE_TTL"] = str(args.cache_ttl)
-    os.environ["W2A_OPENCODE_TIMEOUT"] = str(args.timeout)
     from aiohttp import web
-    from .opencode_bridge import create_app
 
-    web.run_app(create_app(), host=args.host, port=args.port)
+    from .opencode_bridge_runtime import create_app
+
+    web.run_app(
+        create_app(
+            upstream=normalize_url(args.upstream, v1=False),
+            cache_ttl=args.cache_ttl,
+            request_timeout=args.timeout,
+        ),
+        host=args.host,
+        port=args.port,
+    )
     return 0
