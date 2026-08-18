@@ -1,16 +1,7 @@
 """OpenCode compatibility bridge for ChatGPT-Web2API.
 
-This is a thin OpenAI-compatible proxy that adds two behaviours the browser
-bridge intentionally does not provide itself:
-
-* translate OpenAI ``tools`` into a strict text protocol the ChatGPT web model
-  can follow, then translate the model's JSON envelope back into OpenAI
-  ``tool_calls``;
-* coalesce/replay identical in-flight requests for a short period, so a client
-  reconnect does not automatically create a second ChatGPT turn.
-
-The upstream Web2API server remains untouched.  Run it normally, then point
-this bridge at it with ``W2A_UPSTREAM`` (default http://127.0.0.1:8000).
+Adds OpenAI-style tool calling on top of the text-only ChatGPT web bridge and
+protects a logical turn from client disconnect cancellation.
 """
 
 from __future__ import annotations
@@ -33,6 +24,15 @@ _CACHE_TTL = float(os.environ.get("W2A_OPENCODE_CACHE_TTL", "300"))
 _REQUEST_TIMEOUT = float(os.environ.get("W2A_OPENCODE_TIMEOUT", "930"))
 
 _TOOL_SENTINEL = "__W2A_TOOL_CALL__"
+
+
+class ToolProtocolError(ValueError):
+    """A model/client tool protocol violation that should not execute a tool."""
+
+    def __init__(self, message: str, *, code: str = "invalid_tool_call", status: int = 502) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
 
 
 @dataclass
@@ -60,20 +60,66 @@ class OpenCodeBridge:
             await self._session.close()
 
     @staticmethod
-    def _fingerprint(body: dict[str, Any]) -> str:
-        # stream is transport-only.  The logical model turn is otherwise the
-        # same, and must coalesce across a reconnect that changes stream mode.
+    def _fingerprint(body: dict[str, Any], auth_header: str | None = None) -> str:
+        """Hash the logical request, excluding streaming-only transport fields."""
         logical = dict(body)
         logical.pop("stream", None)
-        raw = json.dumps(logical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        logical.pop("stream_options", None)
+        envelope = {
+            "body": logical,
+            # Keep cached/inflight results isolated across credentials without
+            # storing or logging the credential itself.
+            "auth": hashlib.sha256((auth_header or "").encode("utf-8")).hexdigest(),
+        }
+        raw = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _tool_instructions(tools: list[dict[str, Any]]) -> str:
-        compact = []
+    def _function_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
         for item in tools:
             if item.get("type") != "function":
                 continue
+            fn = item.get("function") or {}
+            name = fn.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _tool_choice(body: dict[str, Any]) -> tuple[str, str | None]:
+        choice = body.get("tool_choice", "auto")
+        if choice is None:
+            return "auto", None
+        if isinstance(choice, str):
+            if choice not in {"auto", "none", "required"}:
+                raise ToolProtocolError(
+                    f"Unsupported tool_choice value: {choice}",
+                    code="invalid_tool_choice",
+                    status=400,
+                )
+            return choice, None
+        if isinstance(choice, dict):
+            fn = choice.get("function") or {}
+            name = fn.get("name")
+            if choice.get("type") != "function" or not isinstance(name, str) or not name:
+                raise ToolProtocolError(
+                    "Invalid named tool_choice",
+                    code="invalid_tool_choice",
+                    status=400,
+                )
+            return "named", name
+        raise ToolProtocolError(
+            "Invalid tool_choice type",
+            code="invalid_tool_choice",
+            status=400,
+        )
+
+    @classmethod
+    def _tool_instructions(cls, tools: list[dict[str, Any]], body: dict[str, Any]) -> str:
+        compact = []
+        for item in cls._function_tools(tools):
             fn = item.get("function") or {}
             compact.append(
                 {
@@ -82,23 +128,46 @@ class OpenCodeBridge:
                     "parameters": fn.get("parameters") or {"type": "object"},
                 }
             )
+
+        mode, named = cls._tool_choice(body)
+        names = {item["name"] for item in compact}
+        if mode == "required" and not compact:
+            raise ToolProtocolError(
+                "tool_choice=required but no function tools were supplied",
+                code="invalid_tool_choice",
+                status=400,
+            )
+        if mode == "named" and named not in names:
+            raise ToolProtocolError(
+                f"Named tool_choice refers to unknown tool: {named}",
+                code="invalid_tool_choice",
+                status=400,
+            )
+
         spec = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        policy = "Use a tool only when it is needed."
+        if mode == "required":
+            policy = "You MUST request exactly one of the available tools in this response."
+        elif mode == "named":
+            policy = f"You MUST request the tool named {json.dumps(named)} in this response."
+
         return (
             "\n\n[OpenCode tool protocol]\n"
-            "You can request local tools, but you cannot execute them yourself. "
-            "Available tools are JSON below.\n"
+            "You are connected to OpenCode local tools. You cannot execute these tools yourself.\n"
+            "Available function tools are listed as JSON below:\n"
             f"{spec}\n"
-            "When a tool is required, output ONLY one JSON object in exactly this shape:\n"
+            f"{policy}\n"
+            "When requesting a tool, output ONLY one JSON object in exactly this shape:\n"
             f'{{"{_TOOL_SENTINEL}":true,"name":"tool_name","arguments":{{...}}}}\n'
-            "Do not wrap it in markdown. Do not add prose before or after it. "
-            "If no tool is required, answer normally."
+            "The name MUST exactly match an available tool. arguments MUST be a JSON object.\n"
+            "Do not wrap the object in markdown and do not add prose before or after it.\n"
+            "After OpenCode executes the tool, its result will be supplied in the next request.\n"
+            "If tool use is optional and no tool is needed, answer normally."
         )
 
     @staticmethod
     def _normalise_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
         messages = [dict(m) for m in body.get("messages") or []]
-        # Web2API currently ignores role=tool. Convert tool results into user
-        # context so the web model sees the result on the next turn.
         normalised: list[dict[str, Any]] = []
         for msg in messages:
             role = msg.get("role")
@@ -128,9 +197,11 @@ class OpenCodeBridge:
         upstream = dict(body)
         upstream["stream"] = False
         upstream["messages"] = cls._normalise_messages(body)
-        tools = body.get("tools") or []
-        if tools:
-            instructions = cls._tool_instructions(tools)
+        tools = cls._function_tools(body.get("tools") or [])
+        mode, _ = cls._tool_choice(body)
+
+        if tools and mode != "none":
+            instructions = cls._tool_instructions(tools, body)
             system_index = next(
                 (i for i, msg in enumerate(upstream["messages"]) if msg.get("role") == "system"),
                 None,
@@ -140,9 +211,19 @@ class OpenCodeBridge:
             else:
                 current = upstream["messages"][system_index].get("content") or ""
                 upstream["messages"][system_index]["content"] = current + instructions
+        elif mode in {"required", "named"}:
+            # _tool_instructions normally catches this, but when there are zero
+            # usable tools we never call it.
+            raise ToolProtocolError(
+                "A required tool_choice was supplied without a usable function tool",
+                code="invalid_tool_choice",
+                status=400,
+            )
+
         upstream.pop("tools", None)
         upstream.pop("tool_choice", None)
         upstream.pop("parallel_tool_calls", None)
+        upstream.pop("stream_options", None)
         return upstream
 
     @staticmethod
@@ -151,9 +232,9 @@ class OpenCodeBridge:
         if candidate.startswith("```"):
             lines = candidate.splitlines()
             if len(lines) >= 3 and lines[-1].strip().startswith("```"):
-                candidate = "\n".join(lines[1:-1]).strip()
-                if candidate.startswith("json\n"):
-                    candidate = candidate[5:].strip()
+                first = lines[0].strip().lower()
+                if first in {"```", "```json"}:
+                    candidate = "\n".join(lines[1:-1]).strip()
         try:
             data = json.loads(candidate)
         except (json.JSONDecodeError, TypeError):
@@ -162,6 +243,11 @@ class OpenCodeBridge:
             return None
         name = data.get("name")
         arguments = data.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                return None
         if not isinstance(name, str) or not name:
             return None
         if not isinstance(arguments, dict):
@@ -169,7 +255,30 @@ class OpenCodeBridge:
         return name, arguments
 
     @classmethod
-    def _translate_completion(cls, payload: dict[str, Any]) -> dict[str, Any]:
+    def _validate_tool_call(cls, body: dict[str, Any], name: str) -> None:
+        tools = cls._function_tools(body.get("tools") or [])
+        names = {(item.get("function") or {}).get("name") for item in tools}
+        mode, named = cls._tool_choice(body)
+        if mode == "none":
+            raise ToolProtocolError(
+                "Model requested a tool while tool_choice=none",
+                code="unexpected_tool_call",
+            )
+        if name not in names:
+            raise ToolProtocolError(
+                f"Model requested unavailable tool: {name}",
+                code="unknown_tool_call",
+            )
+        if mode == "named" and name != named:
+            raise ToolProtocolError(
+                f"Model requested {name}, but tool_choice requires {named}",
+                code="wrong_tool_call",
+            )
+
+    @classmethod
+    def _translate_completion(
+        cls, payload: dict[str, Any], body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         choices = payload.get("choices") or []
         if not choices:
             return payload
@@ -180,8 +289,18 @@ class OpenCodeBridge:
             return payload
         parsed = cls._parse_tool_call(text)
         if parsed is None:
+            if body is not None:
+                mode, _ = cls._tool_choice(body)
+                if mode in {"required", "named"} and cls._function_tools(body.get("tools") or []):
+                    raise ToolProtocolError(
+                        "Model returned text although a tool call was required",
+                        code="tool_call_required",
+                    )
             return payload
+
         name, arguments = parsed
+        if body is not None:
+            cls._validate_tool_call(body, name)
         call_id = f"call_{uuid.uuid4().hex[:24]}"
         message["content"] = None
         message["tool_calls"] = [
@@ -198,12 +317,31 @@ class OpenCodeBridge:
         choice["finish_reason"] = "tool_calls"
         return payload
 
+    @staticmethod
+    def _protocol_error_result(exc: ToolProtocolError, ttl: float) -> _CachedResult:
+        return _CachedResult(
+            expires_at=time.monotonic() + ttl,
+            status=exc.status,
+            headers={},
+            payload={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error" if exc.status < 500 else "server_error",
+                    "code": exc.code,
+                }
+            },
+        )
+
     async def _do_upstream(self, body: dict[str, Any], auth_header: str | None) -> _CachedResult:
         assert self._session is not None
+        try:
+            upstream_body = self._prepare_upstream_body(body)
+        except ToolProtocolError as exc:
+            return self._protocol_error_result(exc, self.cache_ttl)
+
         headers = {"Content-Type": "application/json"}
         if auth_header:
             headers["Authorization"] = auth_header
-        upstream_body = self._prepare_upstream_body(body)
         async with self._session.post(
             f"{self.upstream}/v1/chat/completions", headers=headers, json=upstream_body
         ) as resp:
@@ -211,20 +349,53 @@ class OpenCodeBridge:
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
-                payload = {"error": {"message": raw.decode("utf-8", "replace"), "type": "server_error"}}
-            if resp.status < 400:
-                payload = self._translate_completion(payload)
+                payload = {
+                    "error": {
+                        "message": raw.decode("utf-8", "replace"),
+                        "type": "server_error",
+                    }
+                }
+            status = resp.status
+            if status < 400:
+                try:
+                    payload = self._translate_completion(payload, body)
+                except ToolProtocolError as exc:
+                    return self._protocol_error_result(exc, self.cache_ttl)
             keep_headers = {}
             if "Retry-After" in resp.headers:
                 keep_headers["Retry-After"] = resp.headers["Retry-After"]
             return _CachedResult(
                 expires_at=time.monotonic() + self.cache_ttl,
-                status=resp.status,
+                status=status,
                 headers=keep_headers,
                 payload=payload,
             )
 
-    async def _get_result(self, key: str, body: dict[str, Any], auth_header: str | None) -> _CachedResult:
+    async def _finalize_task(self, key: str, task: asyncio.Task[_CachedResult]) -> None:
+        """Move a completed logical turn from inflight to replay cache."""
+        async with self._lock:
+            if self._inflight.get(key) is not task:
+                return
+            self._inflight.pop(key, None)
+            if task.cancelled():
+                return
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is None:
+                self._cache[key] = task.result()
+
+    def _schedule_finalize(self, key: str, task: asyncio.Task[_CachedResult]) -> None:
+        # Done callbacks cannot await the lock, so schedule a tiny coroutine.
+        asyncio.create_task(self._finalize_task(key, task))
+
+    async def _get_result(
+        self,
+        key: str,
+        body: dict[str, Any],
+        auth_header: str | None,
+    ) -> _CachedResult:
         now = time.monotonic()
         async with self._lock:
             stale = [k for k, v in self._cache.items() if v.expires_at <= now]
@@ -237,55 +408,118 @@ class OpenCodeBridge:
             if task is None:
                 task = asyncio.create_task(self._do_upstream(body, auth_header))
                 self._inflight[key] = task
+                task.add_done_callback(lambda done, k=key: self._schedule_finalize(k, done))
 
-        try:
-            # shield is deliberate: cancellation/disconnect of one HTTP client
-            # must not cancel the logical ChatGPT turn shared by reconnects.
-            result = await asyncio.shield(task)
-        finally:
-            if task.done():
-                async with self._lock:
-                    self._inflight.pop(key, None)
-                    if not task.cancelled() and task.exception() is None:
-                        self._cache[key] = task.result()
-        return result
+        # Deliberate: cancellation/disconnect of one HTTP client must not cancel
+        # the logical ChatGPT turn shared by reconnects.
+        return await asyncio.shield(task)
 
     @staticmethod
     def _as_sse(payload: dict[str, Any]) -> bytes:
         choices = payload.get("choices") or []
         if not choices:
             return f"data: {json.dumps(payload)}\n\ndata: [DONE]\n\n".encode()
+
         choice = choices[0]
         message = choice.get("message") or {}
-        delta: dict[str, Any] = {"role": "assistant"}
-        if message.get("tool_calls"):
-            delta["tool_calls"] = message["tool_calls"]
-        else:
-            delta["content"] = message.get("content") or ""
-        chunk = {
-            "id": payload.get("id", f"chatcmpl-{uuid.uuid4().hex[:29]}"),
-            "object": "chat.completion.chunk",
-            "created": payload.get("created", int(time.time())),
-            "model": payload.get("model", ""),
-            "choices": [
+        cid = payload.get("id", f"chatcmpl-{uuid.uuid4().hex[:29]}")
+        created = payload.get("created", int(time.time()))
+        model = payload.get("model", "")
+        events: list[dict[str, Any]] = []
+
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            deltas = []
+            for index, call in enumerate(tool_calls):
+                fn = call.get("function") or {}
+                deltas.append(
+                    {
+                        "index": index,
+                        "id": call.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name"),
+                            "arguments": fn.get("arguments", ""),
+                        },
+                    }
+                )
+            events.append(
                 {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": choice.get("finish_reason", "stop"),
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"tool_calls": deltas},
+                            "finish_reason": None,
+                        }
+                    ],
                 }
-            ],
-        }
-        return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
+            )
+        else:
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                events.append(
+                    {
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": content},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+
+        events.append(
+            {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": choice.get("finish_reason", "stop"),
+                    }
+                ],
+            }
+        )
+
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            events.append(
+                {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": usage,
+                }
+            )
+
+        data = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        return f"{data}data: [DONE]\n\n".encode()
 
     async def chat(self, request: web.Request) -> web.StreamResponse:
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return web.json_response(
-                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
             )
-        key = self._fingerprint(body)
-        result = await self._get_result(key, body, request.headers.get("Authorization"))
+        auth_header = request.headers.get("Authorization")
+        key = self._fingerprint(body, auth_header)
+        result = await self._get_result(key, body, auth_header)
         if body.get("stream") and result.status < 400:
             return web.Response(
                 body=self._as_sse(result.payload),
