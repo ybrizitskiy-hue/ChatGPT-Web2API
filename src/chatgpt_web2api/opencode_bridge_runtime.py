@@ -1,6 +1,6 @@
 """Hardened HTTP runtime for the OpenCode bridge.
 
-The protocol translation lives in :mod:`opencode_bridge`.  This module wraps
+The protocol translation lives in :mod:`opencode_bridge`. This module wraps
 that implementation with strict request validation, upstream error mapping,
 query-preserving GET proxying, explicit health, and shutdown cleanup.
 """
@@ -94,6 +94,65 @@ class RuntimeOpenCodeBridge(OpenCodeBridge):
                 "upstream_connection_error",
                 502,
             )
+
+    async def _finalize_task(self, key: str, task: asyncio.Task[_CachedResult]) -> None:
+        """Promote only successful logical turns into the replay cache."""
+        async with self._lock:
+            if self._inflight.get(key) is not task:
+                return
+            self._inflight.pop(key, None)
+            if task.cancelled():
+                return
+            try:
+                result = task.result()
+            except BaseException:
+                return
+            if result.cacheable and result.status < 400:
+                self._cache[key] = result
+
+    async def _get_result(
+        self,
+        key: str,
+        body: dict[str, Any],
+        auth_header: str | None,
+    ) -> _CachedResult:
+        """Join live turns, replay successes, and immediately retry completed errors.
+
+        The base implementation removes a finished task through an asynchronous
+        done-callback. A fast retry can arrive in the short interval after a
+        non-cacheable task finished but before that callback removed it, causing
+        the retry to reuse the just-finished 4xx/5xx. Detect that state under the
+        lock and start a fresh upstream attempt instead.
+        """
+        now = time.monotonic()
+        async with self._lock:
+            stale = [cache_key for cache_key, value in self._cache.items() if value.expires_at <= now]
+            for cache_key in stale:
+                self._cache.pop(cache_key, None)
+
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached
+
+            task = self._inflight.get(key)
+            if task is not None and task.done():
+                self._inflight.pop(key, None)
+                if not task.cancelled():
+                    try:
+                        completed = task.result()
+                    except BaseException:
+                        completed = None
+                    if completed is not None and completed.cacheable and completed.status < 400:
+                        self._cache[key] = completed
+                        return completed
+                task = None
+
+            if task is None:
+                task = asyncio.create_task(self._do_upstream(body, auth_header))
+                self._inflight[key] = task
+                task.add_done_callback(lambda done, k=key: self._schedule_finalize(k, done))
+
+        return await asyncio.shield(task)
 
     async def chat(self, request: web.Request) -> web.StreamResponse:
         try:
