@@ -1,7 +1,8 @@
-"""OpenCode compatibility bridge for ChatGPT-Web2API.
+"""OpenCode compatibility protocol core for ChatGPT-Web2API.
 
-This sidecar keeps the browser-facing Web2API core unchanged while adding the
-OpenAI Chat function-calling contract expected by OpenCode:
+The hardened production HTTP runtime lives in :mod:`opencode_bridge_runtime`.
+This module owns the OpenAI tool-call translation, replay/coalescing primitives,
+and a small legacy app factory used by tests and direct module execution.
 
 * OpenAI ``tools`` are encoded into a strict text protocol for ChatGPT web;
 * a model tool request is validated and translated back to ``tool_calls``;
@@ -22,7 +23,10 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-_UPSTREAM = os.environ.get("W2A_UPSTREAM", "http://127.0.0.1:8000").rstrip("/")
+# Keep the protocol-core default aligned with Web2API's actual server default
+# and the hardened OpenCode runtime/setup. The production launcher passes this
+# explicitly, but direct module use must not silently target the obsolete 8000.
+_UPSTREAM = os.environ.get("W2A_UPSTREAM", "http://127.0.0.1:8080").rstrip("/")
 _HOST = os.environ.get("W2A_OPENCODE_HOST", "127.0.0.1")
 _PORT = int(os.environ.get("W2A_OPENCODE_PORT", "8010"))
 _CACHE_TTL = float(os.environ.get("W2A_OPENCODE_CACHE_TTL", "300"))

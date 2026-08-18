@@ -210,6 +210,37 @@ function Get-PythonVersionText {
     return (& $Python.Exe @prefix -c "import sys; print('.'.join(map(str, sys.version_info[:3])))").Trim()
 }
 
+function Stop-ManagedStack {
+    param([string]$VenvPath)
+    if (-not $VenvPath -or -not (Test-Path $VenvPath)) { return }
+
+    $venvFull = [IO.Path]::GetFullPath($VenvPath).TrimEnd('\').ToLowerInvariant()
+    $currentPid = $PID
+    try {
+        $managed = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            if ($_.ProcessId -eq $currentPid) { return $false }
+            $exe = if ($_.ExecutablePath) { $_.ExecutablePath.ToLowerInvariant() } else { "" }
+            $cmd = if ($_.CommandLine) { $_.CommandLine.ToLowerInvariant() } else { "" }
+            $fromVenv = $exe.StartsWith($venvFull + "\") -or $cmd.Contains($venvFull)
+            $isWeb2Api = $cmd.Contains("chatgpt_web2api") -or $cmd.Contains("chatgpt-web2api")
+            return $fromVenv -and $isWeb2Api
+        }
+    } catch {
+        Write-Warning "Could not enumerate the previously managed Web2API processes: $($_.Exception.Message)"
+        return
+    }
+
+    foreach ($process in $managed) {
+        try {
+            Write-Host "Stopping previous managed Web2API process PID $($process.ProcessId)..."
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not stop PID $($process.ProcessId): $($_.Exception.Message)"
+        }
+    }
+    if ($managed) { Start-Sleep -Milliseconds 750 }
+}
+
 $script:Base = if ($env:LOCALAPPDATA) {
     Join-Path $env:LOCALAPPDATA "ChatGPT-Web2API-OpenCode"
 } else {
@@ -264,6 +295,14 @@ if (-not (Test-Path $venvPython)) {
     & $pythonCommand.Exe @pythonPrefix -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw "Could not create Python virtual environment." }
 }
+
+# A previous installer run may still have the old package loaded in its
+# supervisor/core/bridge Python processes. Stop only processes launched from
+# THIS installer venv and only when their command line identifies Web2API.
+# This avoids killing unrelated Python services and ensures the updated package
+# actually takes effect before the new launcher starts.
+Stop-ManagedStack -VenvPath $venv
+
 Invoke-Checked -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip")
 Invoke-Checked -FilePath $venvPython -Arguments @(
     "-m", "pip", "install", "--upgrade", $sourceDir

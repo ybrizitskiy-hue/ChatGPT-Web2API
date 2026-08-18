@@ -131,6 +131,8 @@ def start(args: argparse.Namespace) -> int:
                 parsed.hostname or "127.0.0.1",
                 "--port",
                 str(parsed.port or 8010),
+                "--api-key-file",
+                str(args.key_file.expanduser().resolve()),
             ]
             print("Starting OpenCode bridge...")
             children.append(spawn(command))
@@ -234,11 +236,19 @@ def serve(args: argparse.Namespace) -> int:
 
     from .opencode_bridge_runtime import create_app
 
+    api_key = read_key(args.api_key_file.expanduser())
+    if not api_key:
+        print(f"OpenCode bridge API key is missing or empty: {args.api_key_file}")
+        return 2
+
     web.run_app(
         create_app(
             upstream=normalize_url(args.upstream, v1=False),
             cache_ttl=args.cache_ttl,
             request_timeout=args.timeout,
+            cache_max_entries=args.cache_max_entries,
+            heartbeat_interval=args.heartbeat_interval,
+            api_key=api_key,
         ),
         host=args.host,
         port=args.port,
