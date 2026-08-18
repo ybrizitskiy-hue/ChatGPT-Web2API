@@ -16,7 +16,6 @@ from .opencode_setup_common import (
     core_command,
     global_opencode_config_path,
     is_loopback,
-    key_file_path,
     load_object,
     model_catalog,
     normalize_url,
