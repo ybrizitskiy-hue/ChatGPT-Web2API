@@ -3,12 +3,13 @@ import time
 
 import pytest
 
-from chatgpt_web2api.opencode_bridge import OpenCodeBridge, _CachedResult
+from chatgpt_web2api.opencode_bridge import _CachedResult
+from chatgpt_web2api.opencode_bridge_runtime import RuntimeOpenCodeBridge
 
 
 @pytest.mark.asyncio
 async def test_cancelled_client_does_not_cancel_shared_upstream_and_retry_replays(monkeypatch):
-    bridge = OpenCodeBridge(cache_ttl=30)
+    bridge = RuntimeOpenCodeBridge(cache_ttl=30)
     started = asyncio.Event()
     release = asyncio.Event()
     calls = 0
@@ -48,8 +49,8 @@ async def test_cancelled_client_does_not_cancel_shared_upstream_and_retry_replay
 
 
 @pytest.mark.asyncio
-async def test_server_error_is_not_replayed_as_success(monkeypatch):
-    bridge = OpenCodeBridge(cache_ttl=30)
+async def test_completed_server_error_is_retried_even_before_done_callback_runs(monkeypatch):
+    bridge = RuntimeOpenCodeBridge(cache_ttl=30)
     calls = 0
 
     async def fake_upstream(body, auth_header):
@@ -60,6 +61,7 @@ async def test_server_error_is_not_replayed_as_success(monkeypatch):
             status=503,
             headers={},
             payload={"error": {"message": "temporary"}},
+            cacheable=False,
         )
 
     monkeypatch.setattr(bridge, "_do_upstream", fake_upstream)
@@ -71,3 +73,4 @@ async def test_server_error_is_not_replayed_as_success(monkeypatch):
 
     assert first.status == second.status == 503
     assert calls == 2
+    assert key not in bridge._cache
