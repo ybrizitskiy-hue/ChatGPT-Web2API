@@ -45,7 +45,7 @@ Changelog = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API/blob/master/CH
 [project.scripts]
 chatgpt-web2api = "chatgpt_web2api.__main__:main"
 chatgpt-web2api-mcp = "chatgpt_web2api.mcp_server:main"
-chatgpt-web2api-opencode = "chatgpt_web2api.opencode_bridge:main"
+chatgpt-web2api-opencode = "chatgpt_web2api.opencode_setup:main"
 
 [project.optional-dependencies]
 dev = [
