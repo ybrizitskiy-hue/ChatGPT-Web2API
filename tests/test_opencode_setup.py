@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from chatgpt_web2api.opencode_setup import parser
 from chatgpt_web2api.opencode_setup_common import (
     configure_core,
     configure_opencode,
@@ -32,6 +33,13 @@ def test_url_normalisation_and_loopback():
     assert normalize_url("http://127.0.0.1:8080/v1", v1=False) == "http://127.0.0.1:8080"
     assert is_loopback("http://localhost:8080")
     assert not is_loopback("https://web2api.example.test")
+
+
+def test_start_parser_exposes_key_file_expected_by_runtime(tmp_path):
+    key_file = tmp_path / "key"
+    args = parser().parse_args(["start", "--api-key-file", str(key_file)])
+    assert args.key_file == key_file
+    assert not hasattr(args, "api_key_file")
 
 
 def test_configure_core_preserves_settings_and_adds_reliability(tmp_path):
