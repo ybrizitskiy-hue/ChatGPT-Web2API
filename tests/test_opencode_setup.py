@@ -42,6 +42,34 @@ def test_start_parser_exposes_key_file_expected_by_runtime(tmp_path):
     assert not hasattr(args, "api_key_file")
 
 
+def test_runtime_health_rejects_degraded_and_broken(monkeypatch):
+    from chatgpt_web2api import opencode_setup_runtime
+
+    for state, expected in (
+        ("healthy", True),
+        ("starting", True),
+        ("degraded", False),
+        ("broken", False),
+    ):
+        monkeypatch.setattr(
+            opencode_setup_runtime,
+            "request_json",
+            lambda url, key, timeout, state=state: (200, {"status": state}),
+        )
+        assert opencode_setup_runtime.healthy("http://127.0.0.1/health", None) is expected
+
+
+def test_runtime_health_rejects_http_errors(monkeypatch):
+    from chatgpt_web2api import opencode_setup_runtime
+
+    monkeypatch.setattr(
+        opencode_setup_runtime,
+        "request_json",
+        lambda url, key, timeout: (401, {"error": {"message": "no"}}),
+    )
+    assert not opencode_setup_runtime.healthy("http://127.0.0.1/v1/models", "bad")
+
+
 def test_configure_core_preserves_settings_and_adds_reliability(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"log_level": "DEBUG", "api_keys": ["old"]}), encoding="utf-8")
