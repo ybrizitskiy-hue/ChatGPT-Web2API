@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, agent/opencode-tool-bridge]
   pull_request:
     branches: [master]
 
