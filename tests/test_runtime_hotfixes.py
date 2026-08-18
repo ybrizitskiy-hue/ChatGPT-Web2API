@@ -3,10 +3,10 @@ import asyncio
 import pytest
 from aiohttp.test_utils import make_mocked_request
 
+from chatgpt_web2api import runtime_hotfixes
 from chatgpt_web2api.api_server import APIServer
 from chatgpt_web2api.cdp_driver import CDPDriver
 from chatgpt_web2api.config import Config
-from chatgpt_web2api import runtime_hotfixes
 
 
 @pytest.mark.asyncio
