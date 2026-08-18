@@ -148,7 +148,7 @@ def parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--config", type=Path, default=core_config_path())
     start_parser.add_argument("--upstream", default=DEFAULT_UPSTREAM)
     start_parser.add_argument("--bridge-url", default=DEFAULT_BRIDGE_URL)
-    start_parser.add_argument("--api-key-file", type=Path, default=key_file_path())
+    start_parser.add_argument("--api-key-file", dest="key_file", type=Path, default=key_file_path())
     start_parser.add_argument("--no-core", action="store_true")
     start_parser.add_argument("--no-bridge", action="store_true")
     start_parser.add_argument("--launch-opencode", action="store_true")
