@@ -44,11 +44,11 @@ function Test-PythonExecutable {
 }
 
 function Resolve-Python {
-    $py = Get-Command py -ErrorAction SilentlyContinue
-    if ($py) {
+    $launcher = Get-Command py -ErrorAction SilentlyContinue
+    if ($launcher) {
         foreach ($selector in @("-3.13", "-3.12", "-3.11")) {
-            if (Test-PythonExecutable -Exe $py.Source -Prefix @($selector)) {
-                return [pscustomobject]@{ Exe = $py.Source; Prefix = @($selector) }
+            if (Test-PythonExecutable -Exe $launcher.Source -Prefix @($selector)) {
+                return [pscustomobject]@{ Exe = $launcher.Source; Prefix = @($selector) }
             }
         }
     }
@@ -83,8 +83,12 @@ function Resolve-Git {
 
     $known = @()
     if ($env:ProgramFiles) { $known += Join-Path $env:ProgramFiles "Git\cmd\git.exe" }
-    if (${env:ProgramFiles(x86)}) { $known += Join-Path ${env:ProgramFiles(x86)} "Git\cmd\git.exe" }
-    if ($env:LOCALAPPDATA) { $known += Join-Path $env:LOCALAPPDATA "Programs\Git\cmd\git.exe" }
+    if (${env:ProgramFiles(x86)}) {
+        $known += Join-Path ${env:ProgramFiles(x86)} "Git\cmd\git.exe"
+    }
+    if ($env:LOCALAPPDATA) {
+        $known += Join-Path $env:LOCALAPPDATA "Programs\Git\cmd\git.exe"
+    }
     if ($script:Base) { $known += Join-Path $script:Base "mingit\cmd\git.exe" }
 
     foreach ($candidate in $known) {
@@ -102,23 +106,24 @@ function Get-Winget {
 function Install-Python {
     Write-Step "Python 3.11-3.13 was not found; installing Python 3.13"
     if ($DryRun) {
-        Write-Host "DRY RUN: would install Python.Python.3.13 or the official python.org installer."
+        Write-Host "DRY RUN: would install Python.Python.3.13 or use the python.org fallback."
         return
     }
 
     $winget = Get-Winget
     if ($winget) {
-        Write-Host "Trying Windows Package Manager (winget)..."
+        Write-Host "Trying winget..."
         & $winget install --id Python.Python.3.13 -e --source winget --scope user --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0 -and (Resolve-Python)) { return }
-        Write-Warning "winget Python installation did not produce a usable Python. Falling back to python.org."
+        Write-Warning "winget did not produce a usable Python; using python.org fallback."
     }
 
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
-    # Python 3.13.14 is a current 3.13 maintenance release with signed Windows installers.
-    $url = "https://www.python.org/ftp/python/3.13.14/python-3.13.14-$arch.exe"
-    $installer = Join-Path $script:Downloads "python-3.13.14-$arch.exe"
+    $version = "3.13.14"
+    $installer = Join-Path $script:Downloads "python-$version-$arch.exe"
+    $url = "https://www.python.org/ftp/python/$version/python-$version-$arch.exe"
     Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
     $signature = Get-AuthenticodeSignature -FilePath $installer
     if ($signature.Status -ne "Valid") {
         throw "Downloaded Python installer signature is not valid: $($signature.Status)"
@@ -138,23 +143,23 @@ function Install-Python {
         throw "Python installer exited with code $($process.ExitCode)."
     }
     if (-not (Resolve-Python)) {
-        throw "Python installation finished but Python 3.11-3.13 is still not discoverable."
+        throw "Python installation completed, but Python 3.11-3.13 is not discoverable."
     }
 }
 
 function Install-Git {
     Write-Step "Git was not found; installing Git"
     if ($DryRun) {
-        Write-Host "DRY RUN: would install Git.Git or download MinGit from git-for-windows/git."
+        Write-Host "DRY RUN: would install Git.Git or use the MinGit fallback."
         return
     }
 
     $winget = Get-Winget
     if ($winget) {
-        Write-Host "Trying Windows Package Manager (winget)..."
+        Write-Host "Trying winget..."
         & $winget install --id Git.Git -e --source winget --scope user --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0 -and (Resolve-Git)) { return }
-        Write-Warning "winget Git installation did not produce a usable Git. Falling back to MinGit."
+        Write-Warning "winget did not produce a usable Git; using MinGit fallback."
     }
 
     $headers = @{
@@ -162,32 +167,40 @@ function Install-Git {
         "Accept" = "application/vnd.github+json"
         "X-GitHub-Api-Version" = "2022-11-28"
     }
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -Headers $headers
+    $release = Invoke-RestMethod `
+        -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" `
+        -Headers $headers
     $assetPattern = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
         '^MinGit-.*-arm64\.zip$'
     } else {
         '^MinGit-.*-64-bit\.zip$'
     }
-    $asset = $release.assets | Where-Object { $_.name -match $assetPattern } | Select-Object -First 1
+    $asset = $release.assets |
+        Where-Object { $_.name -match $assetPattern } |
+        Select-Object -First 1
     if (-not $asset) {
-        throw "Could not locate a suitable MinGit asset in the latest Git for Windows release."
+        throw "Could not find a suitable MinGit asset in the latest Git for Windows release."
     }
 
     $archive = Join-Path $script:Downloads $asset.name
     $destination = Join-Path $script:Base "mingit"
     if (Test-Path $destination) { Remove-Item -Recurse -Force $destination }
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -Headers $headers -UseBasicParsing
+    Invoke-WebRequest `
+        -Uri $asset.browser_download_url `
+        -OutFile $archive `
+        -Headers $headers `
+        -UseBasicParsing
 
     if ($asset.digest -and $asset.digest -match '^sha256:(?<hash>[0-9a-fA-F]{64})$') {
         $actualHash = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash
         if ($actualHash -ne $Matches.hash) {
-            throw "MinGit SHA256 mismatch. Expected $($Matches.hash), got $actualHash."
+            throw "MinGit SHA256 mismatch."
         }
     }
 
     Expand-Archive -Path $archive -DestinationPath $destination -Force
     if (-not (Resolve-Git)) {
-        throw "MinGit extraction finished but git.exe is still unavailable."
+        throw "MinGit extraction completed, but git.exe is not discoverable."
     }
 }
 
@@ -224,7 +237,7 @@ if (-not $pythonCommand) {
 
 if ($DryRun) {
     Write-Host ""
-    Write-Host "DRY RUN completed. Prerequisite/bootstrap code parsed and planned successfully." -ForegroundColor Green
+    Write-Host "DRY RUN completed successfully." -ForegroundColor Green
     exit 0
 }
 
@@ -240,7 +253,9 @@ if (Test-Path (Join-Path $sourceDir ".git")) {
     Invoke-Checked -FilePath $gitExe -Arguments @("-C", $sourceDir, "reset", "--hard", "origin/$Branch")
 } else {
     if (Test-Path $sourceDir) { Remove-Item -Recurse -Force $sourceDir }
-    Invoke-Checked -FilePath $gitExe -Arguments @("clone", "--branch", $Branch, "--single-branch", $Repository, $sourceDir)
+    Invoke-Checked -FilePath $gitExe -Arguments @(
+        "clone", "--branch", $Branch, "--single-branch", $Repository, $sourceDir
+    )
 }
 
 Write-Step "Creating isolated Python environment"
@@ -250,7 +265,9 @@ if (-not (Test-Path $venvPython)) {
     if ($LASTEXITCODE -ne 0) { throw "Could not create Python virtual environment." }
 }
 Invoke-Checked -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip")
-Invoke-Checked -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", $sourceDir)
+Invoke-Checked -FilePath $venvPython -Arguments @(
+    "-m", "pip", "install", "--upgrade", $sourceDir
+)
 
 Write-Step "Configuring Web2API and OpenCode"
 $setupArgs = @(
@@ -266,7 +283,9 @@ $oldSecret = $env:W2A_OPENCODE_API_KEY
 try {
     if ($ApiKey) { $env:W2A_OPENCODE_API_KEY = $ApiKey }
     & $venvPython @setupArgs
-    if ($LASTEXITCODE -ne 0) { throw "OpenCode integration setup failed with exit code $LASTEXITCODE." }
+    if ($LASTEXITCODE -ne 0) {
+        throw "OpenCode integration setup failed with exit code $LASTEXITCODE."
+    }
 } finally {
     if ($null -eq $oldSecret) {
         Remove-Item Env:W2A_OPENCODE_API_KEY -ErrorAction SilentlyContinue
@@ -287,18 +306,18 @@ if (-not $ConfigureOnly -and -not $NoStart) {
     if (Test-Path $launcher) {
         Write-Step "Starting ChatGPT-Web2API and the OpenCode bridge"
         Start-Process -FilePath "cmd.exe" -ArgumentList @("/k", "`"$launcher`"") | Out-Null
-        Start-Sleep -Seconds 2
-        Start-Process "https://chatgpt.com/" | Out-Null
-        Write-Host "A service window and ChatGPT have been opened. Sign in to ChatGPT in the dedicated Chrome profile if prompted."
+        Write-Host "The service window is starting. Web2API will open its managed Chrome profile."
+        Write-Host "Sign in to ChatGPT in that managed Chrome window if prompted."
     } else {
-        Write-Warning "Generated launcher was not found at $launcher. Run: $venvPython -m chatgpt_web2api.opencode_setup start"
+        Write-Warning "Generated launcher was not found at $launcher."
+        Write-Warning "Run: $venvPython -m chatgpt_web2api.opencode_setup start"
     }
 }
 
 Write-Host ""
 Write-Host "DONE" -ForegroundColor Green
-Write-Host "1. Sign in to ChatGPT in the Chrome window opened by Web2API."
+Write-Host "1. Sign in to ChatGPT in the Chrome profile opened by Web2API."
 Write-Host "2. Restart/open OpenCode."
-Write-Host "3. Select the chatgpt-web/$Model provider/model (or run /models)."
+Write-Host "3. Select the chatgpt-web/$Model provider/model (or use OpenCode model selection)."
 Write-Host ""
-Write-Host "No OpenAI API key is required. The generated key is only a local password for this bridge."
+Write-Host "No OpenAI API key is required. The generated key is only a local bridge password."
