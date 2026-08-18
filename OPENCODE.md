@@ -1,130 +1,91 @@
 # OpenCode + ChatGPT-Web2API
 
-This integration lets OpenCode use a model selected in the ChatGPT web UI while OpenCode keeps control of local coding tools such as file reads, edits, search, and shell commands.
+This fork lets OpenCode use ChatGPT Web as the model while OpenCode keeps control of local coding tools (`read`, `edit`, `grep`, shell commands, and other function tools).
 
-> This is an unofficial browser bridge. It is not the official OpenAI API and it can break when ChatGPT or OpenCode changes. Keep the bridge bound to localhost unless you deliberately secure a remote deployment.
+> This is an unofficial browser bridge, not the official OpenAI API. Keep it on loopback unless you deliberately secure a remote deployment. ChatGPT/OpenCode UI or protocol changes can require maintenance.
 
 ## Architecture
 
 ```text
 OpenCode Desktop / CLI
         |
-        | OpenAI-compatible chat + tool_calls
+        | OpenAI-compatible Chat Completions + tool_calls
         v
 OpenCode bridge     http://127.0.0.1:8010/v1
         |
-        | text protocol + reconnect protection
+        | strict text tool protocol + reconnect protection
         v
 ChatGPT-Web2API     http://127.0.0.1:8080/v1
         |
         | Chrome DevTools Protocol
         v
-Chrome -> chatgpt.com -> selected ChatGPT model
+Dedicated Chrome profile -> chatgpt.com -> selected ChatGPT model
 ```
 
-OpenCode executes tools locally. The model only requests a tool. The bridge translates the request into OpenAI-compatible `tool_calls`, OpenCode runs the tool, and the next request carries the tool result back to the model.
+OpenCode executes tools locally. ChatGPT only requests a tool. The bridge validates the request, converts it to an OpenAI-style `tool_calls` response, and returns the subsequent OpenCode tool result to ChatGPT on the next turn.
 
-## Requirements
+## Windows: one-click install
 
-- Windows, macOS, or Linux
-- Python 3.11 or newer
-- Google Chrome or Chromium
-- OpenCode Desktop or OpenCode CLI
-- A ChatGPT account that can use the model you select
-
-## Easiest Windows setup
-
-Clone or download this repository, then double-click:
+Download or clone this repository and double-click:
 
 ```text
 scripts\setup-opencode.cmd
 ```
 
-The script creates an isolated Python environment, installs this fork, runs the setup wizard, writes the OpenCode provider configuration, and starts the local stack. A dedicated Chrome window opens; sign in to ChatGPT there.
+The Windows installer is designed to be self-contained:
 
-PowerShell users can supply values directly:
+1. detects Git; if missing, installs Git with `winget`, with a MinGit fallback;
+2. detects a supported Python 3.11-3.13; if missing, installs Python 3.13 with `winget`, with an official python.org installer fallback;
+3. clones/updates this fork from `master` into a managed directory under `%LOCALAPPDATA%`;
+4. creates an isolated Python virtual environment;
+5. installs ChatGPT-Web2API and the OpenCode bridge;
+6. generates a strong local Web2API key when one was not supplied;
+7. writes that key to `~/.chatgpt-web2api/opencode-api-key`;
+8. updates the OpenCode provider config and references the key with OpenCode's `{file:...}` syntax, so you do not paste the key manually;
+9. configures OpenCode `baseURL` as `http://127.0.0.1:8010/v1`;
+10. creates reusable start launchers and starts the local stack.
+
+**No OpenAI API key is required.** The generated API key is only a local password between OpenCode, the bridge, and Web2API.
+
+After installation, the only interactive step is signing in to ChatGPT in the dedicated Chrome profile opened by Web2API. Do not send the installer your ChatGPT password, MFA code, cookies, or session token.
+
+### Optional command-line values
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-opencode.ps1 `
-  -ApiKey "my-local-key" `
   -Upstream "http://127.0.0.1:8080" `
   -BridgeUrl "http://127.0.0.1:8010/v1" `
   -Model "auto"
 ```
 
-The API key is a local password between OpenCode, the bridge, and Web2API. For a local setup it may be omitted; the wizard generates a strong key and stores it in a private file.
+For an existing secured Web2API deployment you may explicitly supply its existing key with `-ApiKey`. For a normal local install, omit it and let setup generate the key.
 
-## Easiest macOS/Linux setup
+## macOS / Linux
+
+Python 3.11+ and Git must currently be installed by the OS/package manager first. Then:
 
 ```bash
+git clone https://github.com/ybrizitskiy-hue/ChatGPT-Web2API.git
+cd ChatGPT-Web2API
 chmod +x scripts/setup-opencode.sh
 ./scripts/setup-opencode.sh
 ```
 
-Optional values can be supplied with environment variables:
+## What gets configured
 
-```bash
-W2A_API_KEY='my-local-key' \
-W2A_UPSTREAM='http://127.0.0.1:8080' \
-W2A_BRIDGE_URL='http://127.0.0.1:8010/v1' \
-W2A_MODEL='auto' \
-./scripts/setup-opencode.sh
+The default local files are:
+
+```text
+~/.chatgpt-web2api/config.json
+~/.chatgpt-web2api/opencode-api-key
+~/.config/opencode/opencode.json
+~/.chatgpt-web2api/start-opencode-web2api.cmd
+~/.chatgpt-web2api/start-opencode-web2api.sh
 ```
 
-## Manual install
+Existing OpenCode configuration is merged rather than replaced. Timestamped backups are created before rewriting an existing config.
 
-From a checkout of this repository:
-
-```bash
-python -m venv .venv
-```
-
-Activate the environment, then install:
-
-```bash
-python -m pip install -e .
-```
-
-Run the setup wizard:
-
-```bash
-chatgpt-web2api-opencode setup --set-default --start
-```
-
-Non-interactive example:
-
-```bash
-chatgpt-web2api-opencode setup \
-  --non-interactive \
-  --api-key 'replace-with-your-key' \
-  --upstream http://127.0.0.1:8080 \
-  --bridge-url http://127.0.0.1:8010/v1 \
-  --model auto \
-  --set-default
-```
-
-Then start the generated launcher:
-
-- Windows: `~/.chatgpt-web2api/start-opencode-web2api.cmd`
-- macOS/Linux: `~/.chatgpt-web2api/start-opencode-web2api.sh`
-
-Or start directly:
-
-```bash
-chatgpt-web2api-opencode start
-```
-
-## What setup changes
-
-The wizard creates or updates these files and makes timestamped backups before replacing existing configuration:
-
-- `~/.chatgpt-web2api/config.json` — local Web2API configuration
-- `~/.chatgpt-web2api/opencode-api-key` — API key referenced by OpenCode
-- `~/.config/opencode/opencode.json` — global OpenCode configuration
-- `~/.chatgpt-web2api/start-opencode-web2api.cmd`
-- `~/.chatgpt-web2api/start-opencode-web2api.sh`
-
-The generated OpenCode provider is equivalent to:
+The generated provider is equivalent to:
 
 ```json
 {
@@ -135,7 +96,7 @@ The generated OpenCode provider is equivalent to:
       "name": "ChatGPT Web2API",
       "options": {
         "baseURL": "http://127.0.0.1:8010/v1",
-        "apiKey": "{file:/absolute/path/to/.chatgpt-web2api/opencode-api-key}",
+        "apiKey": "{file:C:/Users/YOU/.chatgpt-web2api/opencode-api-key}",
         "timeout": false,
         "headerTimeout": 960000,
         "chunkTimeout": 120000
@@ -149,138 +110,29 @@ The generated OpenCode provider is equivalent to:
       }
     }
   },
-  "model": "chatgpt-web/auto",
-  "permission": {
-    "edit": "ask",
-    "bash": "ask",
-    "external_directory": "ask"
-  }
+  "model": "chatgpt-web/auto"
 }
 ```
 
-The wizard preserves unrelated OpenCode settings and existing models under the same provider. It adds the conservative permission policy only when the config has no permission policy yet. Use `--no-safe-permissions` to skip that addition.
+The exact key path is generated for the current user; the literal secret is not embedded into OpenCode config.
 
-## Selecting Sol or another model
+## Start later
 
-The safest model identifier is the exact ID returned by your running account:
-
-```bash
-curl -H "Authorization: Bearer YOUR_KEY" \
-  http://127.0.0.1:8080/v1/models
-```
-
-Then rerun setup with the returned ID:
-
-```bash
-chatgpt-web2api-opencode setup \
-  --api-key 'YOUR_KEY' \
-  --model 'MODEL_ID_FROM_THE_CATALOG' \
-  --set-default
-```
-
-When `auto` is configured, Web2API does not force a model slug; it uses the model active in the ChatGPT browser UI. This is useful when the web UI exposes a model that is not yet stable enough to hard-code.
-
-After changing the model in ChatGPT, start a new OpenCode session so the model context is clean.
-
-## Project-local OpenCode config
-
-To configure only one project instead of the global OpenCode config:
-
-```bash
-cd /path/to/project
-chatgpt-web2api-opencode setup \
-  --scope project \
-  --project-dir . \
-  --set-default
-```
-
-The wizard writes `opencode.json` in the selected project unless an existing supported project config is found.
-
-## Remote Web2API or remote bridge
-
-A remote Web2API endpoint must already be running and must accept the API key you provide. The wizard does not modify a remote server.
-
-```bash
-chatgpt-web2api-opencode setup \
-  --api-key 'REMOTE_SERVER_KEY' \
-  --upstream 'https://web2api.example.com' \
-  --bridge-url 'http://127.0.0.1:8010/v1' \
-  --model auto \
-  --set-default
-```
-
-This starts only the local bridge. When `--bridge-url` is remote too, the generated launcher starts neither service and only verifies that both remote endpoints are reachable.
-
-Do not expose Web2API or the bridge to the public internet without TLS, authentication, firewall restrictions, and a threat model. The bridge forwards the bearer key to Web2API.
-
-## Verify the installation
-
-Run the wiring doctor:
-
-```bash
-chatgpt-web2api-opencode doctor
-```
-
-A healthy result includes:
+Windows:
 
 ```text
-OK    Web2API config
-OK    API key file
-OK    OpenCode provider
-OK    Web2API health
-OK    Web2API authentication
-OK    Bridge health
-OK    Model catalog
+%USERPROFILE%\.chatgpt-web2api\start-opencode-web2api.cmd
 ```
 
-The doctor validates configuration, authentication, and model discovery. It does not spend a ChatGPT turn.
-
-Then test the agent in OpenCode with a harmless task:
-
-```text
-Read README.md and report the first heading. Do not edit anything.
-```
-
-After that, test permission-gated tool use in a temporary project:
-
-```text
-Create a file named opencode-bridge-smoke.txt containing the word OK, read it back, then delete it.
-```
-
-OpenCode should ask before editing or running shell commands under the default safety policy.
-
-## Disconnect and recovery behavior
-
-The bridge deliberately buffers the browser-backed model turn before sending a short SSE result to OpenCode. This avoids cancelling the browser turn merely because the client HTTP stream disappears.
-
-| Failure | What happens |
-|---|---|
-| OpenCode window closes or its request is cancelled while the bridge stays alive | The upstream ChatGPT turn continues. An identical retry joins the in-flight task. |
-| Connection returns after the turn completed, while the bridge process is still alive | The successful result can be replayed from memory for the configured TTL, 60 seconds by default. |
-| OpenCode retries while the original turn is still running | The retry joins the same in-flight task; the bridge does not send a second ChatGPT message. |
-| Bridge process crashes or the computer reboots during generation | The in-memory recovery state is lost. There is no automatic reattachment to that ChatGPT turn. Inspect the browser conversation before retrying because a blind retry may duplicate the message. |
-| Web2API or Chrome disconnects | Web2API's own detector/reconciliation handles recoverable browser conditions. The bridge returns a structured 5xx error when the upstream cannot be recovered. |
-
-The bridge also recognizes `Idempotency-Key` and `X-Idempotency-Key`. OpenCode does not currently need to send one for ordinary reconnect protection, but other compatible clients may use these headers.
-
-The replay cache is intentionally short. It protects reconnects, not semantic caching. Change it only with a clear reason:
+Or from an activated environment:
 
 ```bash
-chatgpt-web2api-opencode serve --cache-ttl 120
+chatgpt-web2api-opencode start
 ```
 
-## Current limitations
+The launcher starts Web2API on port 8080 and the OpenCode bridge on port 8010. Keep its terminal open while using OpenCode.
 
-- One model-requested tool call per model turn. OpenCode can perform many tools across successive turns.
-- The ChatGPT web response is buffered. OpenCode does not receive true token-by-token browser streaming.
-- Recovery state is process-local, not durable across a bridge crash or reboot.
-- Browser and web UI changes can break the underlying Web2API selectors or protocol.
-- Text tool results are supported. This bridge is not a general multimodal transport.
-- The setup does not prove that every ChatGPT model will reliably obey the JSON tool envelope; use the smoke test before real work.
-
-## Troubleshooting
-
-### OpenCode shows no model
+## Verify wiring
 
 Run:
 
@@ -288,62 +140,105 @@ Run:
 chatgpt-web2api-opencode doctor
 ```
 
-Then inspect `~/.config/opencode/opencode.json` and verify that the provider ID and model ID match `chatgpt-web/<model>`.
+A healthy local installation should report successful checks for:
 
-### HTTP 401
-
-The key in `~/.chatgpt-web2api/opencode-api-key` is not accepted by the running Web2API process. Restart the local launcher so Web2API reloads `~/.chatgpt-web2api/config.json`, or provide the correct remote server key.
-
-### Long reasoning request times out
-
-Ensure OpenCode points to the bridge, not directly to port 8080. The generated provider disables the full request timeout and raises the response-header timeout because the bridge buffers a long browser turn before returning SSE.
-
-### OpenCode repeats a tool call after a hard crash
-
-Stop and inspect the ChatGPT browser conversation and the working tree. Crash-safe turn reconciliation is not implemented. Do not blindly retry write operations.
-
-### The bridge is running but ChatGPT is not logged in
-
-Bring the dedicated Chrome window to the foreground and sign in at `chatgpt.com`. Keep that profile; Web2API reuses it on later launches.
-
-### Port conflict
-
-Choose different local URLs during setup:
-
-```bash
-chatgpt-web2api-opencode setup \
-  --upstream http://127.0.0.1:8180 \
-  --bridge-url http://127.0.0.1:8110/v1 \
-  --set-default
+```text
+Web2API config
+API key file
+OpenCode provider
+Web2API health
+Web2API authentication
+Bridge health
+Model catalog
 ```
 
-## Updating
+The launcher deliberately rejects a Web2API `degraded`/`broken` health state instead of reporting it as ready.
 
-From a repository checkout:
+## Select Sol or another model
+
+Do not hard-code a guessed model slug. Once logged in, get the model catalog from the running account and use an exact returned ID.
+
+With the generated key:
+
+```powershell
+$key = (Get-Content "$HOME\.chatgpt-web2api\opencode-api-key" -Raw).Trim()
+Invoke-RestMethod `
+  -Headers @{ Authorization = "Bearer $key" } `
+  -Uri "http://127.0.0.1:8080/v1/models"
+```
+
+Then rerun setup with the exact ID if you want it as the OpenCode default:
 
 ```bash
-git pull
-python -m pip install -e .
-chatgpt-web2api-opencode setup --set-default
+chatgpt-web2api-opencode setup --model EXACT_MODEL_ID --set-default
+```
+
+`auto` is safe for initial setup and follows the active/default web model behavior rather than inventing a Sol slug.
+
+## Tool behavior
+
+OpenCode sends its function schemas to the bridge. The bridge gives ChatGPT a strict tool-request protocol. A valid model request such as:
+
+```json
+{"__W2A_TOOL_CALL__":true,"name":"read","arguments":{"path":"README.md"}}
+```
+
+is translated to an OpenAI-compatible `tool_calls` delta. The bridge validates the offered tool names and `tool_choice` and never executes a local tool itself.
+
+Current deliberate limitation: **one model-requested tool call per model turn**. OpenCode can still perform many sequential tool turns in one task.
+
+## Disconnect/retry behavior
+
+For OpenCode requests the bridge keeps the browser-backed model turn independent from the client HTTP connection:
+
+- cancelling/disconnecting one OpenCode request does not cancel the shared upstream task;
+- an identical retry while that turn is still running joins the same task;
+- a successful result can be briefly replayed without another ChatGPT SEND;
+- 401/429/5xx failures are not stored as successful replay entries;
+- the bridge emits OpenCode-compatible SSE after the browser turn completes.
+
+This protects normal client reconnects **while the bridge process stays alive**.
+
+It is not crash-safe exactly-once delivery. If the bridge process or computer dies after ChatGPT accepted a message, ChatGPT may have completed that turn even though OpenCode did not receive it. Before retrying a write/shell-capable turn after a hard crash, inspect the ChatGPT conversation and working tree instead of blindly resending it.
+
+## Safety
+
+The installer keeps OpenCode's existing permission policy. When no policy exists, setup adds conservative `ask` permissions for edits, shell commands, and external-directory access.
+
+Treat repository files, command output, web content, and tool results as potentially hostile prompt content. Approval prompts remain an important boundary because tool calling over ChatGPT Web is emulated through text rather than a native local-tool channel.
+
+## Troubleshooting
+
+### OpenCode does not show `chatgpt-web`
+
+Run:
+
+```bash
 chatgpt-web2api-opencode doctor
 ```
 
-The setup wizard backs up existing configuration before rewriting it.
+Then restart OpenCode so it reloads `~/.config/opencode/opencode.json`.
 
-## Uninstalling
+### HTTP 401
 
-Stop the launcher, remove the `chatgpt-web` provider from the OpenCode config, and optionally remove:
+Restart the generated launcher so Web2API reloads `~/.chatgpt-web2api/config.json`. The key in `~/.chatgpt-web2api/opencode-api-key` must match one of Web2API's configured keys.
+
+### Long reasoning request times out
+
+Confirm OpenCode points to:
 
 ```text
-~/.chatgpt-web2api/opencode-api-key
-~/.chatgpt-web2api/start-opencode-web2api.cmd
-~/.chatgpt-web2api/start-opencode-web2api.sh
+http://127.0.0.1:8010/v1
 ```
 
-Keep the Chrome profile if you intend to continue using ChatGPT-Web2API.
+not directly to port 8080. The generated provider disables OpenCode's full request timeout and gives the bridge a long response-header window because the browser turn is buffered before SSE is returned.
 
-## More detail
+### Login required
 
-- Technical design and protocol: [`docs/opencode-bridge.md`](docs/opencode-bridge.md)
-- Agent handover and acceptance checklist: [`docs/opencode-handover.md`](docs/opencode-handover.md)
+Sign in only in the Chrome profile opened by Web2API. The profile is reused on later launches.
+
+## Technical details / agent handover
+
+- Bridge design and reliability: [`docs/opencode-bridge.md`](docs/opencode-bridge.md)
+- Full handover for a coding agent: [`docs/opencode-handover.md`](docs/opencode-handover.md)
 - OpenCode documentation: <https://opencode.ai/docs>
