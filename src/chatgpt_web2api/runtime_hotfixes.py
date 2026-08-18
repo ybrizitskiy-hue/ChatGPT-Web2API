@@ -1,7 +1,7 @@
 """Narrow runtime recoveries for browser/CDP edge cases seen in live OpenCode use.
 
 These patches deliberately reconcile observable browser state after an ambiguous
-CDP timeout instead of blindly retrying a navigation or chat send.  They are
+CDP timeout instead of blindly retrying a navigation or chat send. They are
 kept in one small module so the behavior is easy to remove once the underlying
 CDP implementation absorbs the same logic directly.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import urllib.parse
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -24,15 +25,34 @@ def _is_page_navigate_timeout(exc: BaseException) -> bool:
     return isinstance(exc, TimeoutError) and "CDP timeout: Page.navigate" in str(exc)
 
 
-async def _new_chat_is_ready(driver: Any) -> bool:
-    """Observe whether the live tab is already usable after a navigation timeout."""
+def _is_expected_new_chat_url(url: str, gizmo_id: str | None) -> bool:
+    """Require the actual destination, not merely any ChatGPT page with a composer."""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in {"chatgpt.com", "www.chatgpt.com"}:
+        return False
+    path = parsed.path.rstrip("/") or "/"
+    if gizmo_id:
+        return path == f"/g/{gizmo_id}/project"
+    # A fresh non-project chat may normalize/drop ?model=auto, but it must not
+    # still be an existing conversation or another project route.
+    return path == "/"
+
+
+async def _new_chat_is_ready(driver: Any, gizmo_id: str | None) -> bool:
+    """Observe whether the requested new-chat destination is actually usable."""
     try:
         if not await driver._has_composer():
             return False
         url = await driver._js("location.href", timeout=5)
     except Exception:
         return False
-    return isinstance(url, str) and "chatgpt.com" in url.lower()
+    return _is_expected_new_chat_url(url, gizmo_id)
 
 
 async def _conversation_is_ready(driver: Any, conversation_id: str) -> bool:
@@ -78,10 +98,11 @@ def install_runtime_hotfixes() -> None:
                 "Page.navigate timed out while opening a new chat; reconciling live page state"
             )
             if await _wait_until(
-                lambda: _new_chat_is_ready(self), NAVIGATION_RECONCILE_TIMEOUT_SECONDS
+                lambda: _new_chat_is_ready(self, gizmo_id),
+                NAVIGATION_RECONCILE_TIMEOUT_SECONDS,
             ):
                 # The CDP command response was lost/late, but the browser did
-                # complete the transition.  Do not navigate again: a second
+                # complete the transition. Do not navigate again: a second
                 # navigation can create another chat/tab and is unnecessary.
                 self._current_conv_id = None
                 logger.info("Recovered Page.navigate timeout: new-chat composer is ready")
@@ -129,7 +150,7 @@ def install_runtime_hotfixes() -> None:
             self._w2a_model_catalog_task = None
         except TimeoutError:
             # Do not cancel the CDP operation: cancellation can leave a pending
-            # CDP future behind.  Let the single shared task finish in the
+            # CDP future behind. Let the single shared task finish in the
             # background and serve the stable fallback catalog immediately.
             logger.warning(
                 "Model catalog probe exceeded %.1fs; serving fallback catalog",
