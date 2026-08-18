@@ -9,6 +9,22 @@ from chatgpt_web2api.cdp_driver import CDPDriver
 from chatgpt_web2api.config import Config
 
 
+def test_new_chat_reconciliation_requires_actual_new_chat_route():
+    assert runtime_hotfixes._is_expected_new_chat_url(
+        "https://chatgpt.com/?model=auto", None
+    )
+    assert runtime_hotfixes._is_expected_new_chat_url("https://chatgpt.com/", None)
+    assert not runtime_hotfixes._is_expected_new_chat_url(
+        "https://chatgpt.com/c/existing-conversation", None
+    )
+    assert runtime_hotfixes._is_expected_new_chat_url(
+        "https://chatgpt.com/g/project-123/project", "project-123"
+    )
+    assert not runtime_hotfixes._is_expected_new_chat_url(
+        "https://chatgpt.com/g/other-project/project", "project-123"
+    )
+
+
 @pytest.mark.asyncio
 async def test_new_chat_page_navigate_timeout_reconciles_without_second_navigation(monkeypatch):
     driver = CDPDriver(tab_mode="adopt")
