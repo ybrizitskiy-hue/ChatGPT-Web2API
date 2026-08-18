@@ -1,7 +1,12 @@
 """OpenCode compatibility bridge for ChatGPT-Web2API.
 
-Adds OpenAI-style tool calling on top of the text-only ChatGPT web bridge and
-protects a logical turn from client disconnect cancellation.
+This sidecar keeps the browser-facing Web2API core unchanged while adding the
+OpenAI Chat function-calling contract expected by OpenCode:
+
+* OpenAI ``tools`` are encoded into a strict text protocol for ChatGPT web;
+* a model tool request is validated and translated back to ``tool_calls``;
+* OpenCode ``role=tool`` results are made visible to the web model;
+* identical in-flight turns are coalesced and shielded from client disconnects.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ _TOOL_SENTINEL = "__W2A_TOOL_CALL__"
 
 
 class ToolProtocolError(ValueError):
-    """A model/client tool protocol violation that should not execute a tool."""
+    """A model/client tool-protocol violation that must not execute a tool."""
 
     def __init__(self, message: str, *, code: str = "invalid_tool_call", status: int = 502) -> None:
         super().__init__(message)
@@ -41,6 +46,7 @@ class _CachedResult:
     status: int
     headers: dict[str, str]
     payload: dict[str, Any]
+    cacheable: bool = True
 
 
 class OpenCodeBridge:
@@ -61,14 +67,13 @@ class OpenCodeBridge:
 
     @staticmethod
     def _fingerprint(body: dict[str, Any], auth_header: str | None = None) -> str:
-        """Hash the logical request, excluding streaming-only transport fields."""
+        """Hash the logical turn, excluding streaming-only transport fields."""
         logical = dict(body)
         logical.pop("stream", None)
         logical.pop("stream_options", None)
         envelope = {
             "body": logical,
-            # Keep cached/inflight results isolated across credentials without
-            # storing or logging the credential itself.
+            # Isolate replay state across credentials without storing the key.
             "auth": hashlib.sha256((auth_header or "").encode("utf-8")).hexdigest(),
         }
         raw = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -82,9 +87,8 @@ class OpenCodeBridge:
                 continue
             fn = item.get("function") or {}
             name = fn.get("name")
-            if not isinstance(name, str) or not name:
-                continue
-            result.append(item)
+            if isinstance(name, str) and name:
+                result.append(item)
         return result
 
     @staticmethod
@@ -160,7 +164,7 @@ class OpenCodeBridge:
             "When requesting a tool, output ONLY one JSON object in exactly this shape:\n"
             f'{{"{_TOOL_SENTINEL}":true,"name":"tool_name","arguments":{{...}}}}\n'
             "The name MUST exactly match an available tool. arguments MUST be a JSON object.\n"
-            "Do not wrap the object in markdown and do not add prose before or after it.\n"
+            "Do not add prose before or after the object.\n"
             "After OpenCode executes the tool, its result will be supplied in the next request.\n"
             "If tool use is optional and no tool is needed, answer normally."
         )
@@ -212,8 +216,6 @@ class OpenCodeBridge:
                 current = upstream["messages"][system_index].get("content") or ""
                 upstream["messages"][system_index]["content"] = current + instructions
         elif mode in {"required", "named"}:
-            # _tool_instructions normally catches this, but when there are zero
-            # usable tools we never call it.
             raise ToolProtocolError(
                 "A required tool_choice was supplied without a usable function tool",
                 code="invalid_tool_choice",
@@ -227,20 +229,65 @@ class OpenCodeBridge:
         return upstream
 
     @staticmethod
-    def _parse_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
+    def _extract_sentinel_object(text: str) -> str | None:
+        """Extract a JSON object containing our private sentinel from light prose/fences."""
+        marker = f'"{_TOOL_SENTINEL}"'
+        marker_at = text.find(marker)
+        if marker_at < 0:
+            return None
+        start = text.rfind("{", 0, marker_at + 1)
+        if start < 0:
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1]
+        return None
+
+    @classmethod
+    def _parse_tool_call(cls, text: str) -> tuple[str, dict[str, Any]] | None:
         candidate = text.strip()
-        if candidate.startswith("```"):
-            lines = candidate.splitlines()
-            if len(lines) >= 3 and lines[-1].strip().startswith("```"):
-                first = lines[0].strip().lower()
-                if first in {"```", "```json"}:
-                    candidate = "\n".join(lines[1:-1]).strip()
-        try:
-            data = json.loads(candidate)
-        except (json.JSONDecodeError, TypeError):
+        candidates = [candidate]
+        extracted = cls._extract_sentinel_object(candidate)
+        if extracted and extracted != candidate:
+            candidates.append(extracted)
+
+        data: Any = None
+        for item in candidates:
+            if item.startswith("```"):
+                lines = item.splitlines()
+                if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+                    first = lines[0].strip().lower()
+                    if first in {"```", "```json"}:
+                        item = "\n".join(lines[1:-1]).strip()
+            try:
+                parsed = json.loads(item)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(parsed, dict) and parsed.get(_TOOL_SENTINEL) is True:
+                data = parsed
+                break
+        if not isinstance(data, dict):
             return None
-        if not isinstance(data, dict) or data.get(_TOOL_SENTINEL) is not True:
-            return None
+
         name = data.get("name")
         arguments = data.get("arguments", {})
         if isinstance(arguments, str):
@@ -248,9 +295,7 @@ class OpenCodeBridge:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError:
                 return None
-        if not isinstance(name, str) or not name:
-            return None
-        if not isinstance(arguments, dict):
+        if not isinstance(name, str) or not name or not isinstance(arguments, dict):
             return None
         return name, arguments
 
@@ -287,6 +332,7 @@ class OpenCodeBridge:
         text = message.get("content")
         if not isinstance(text, str):
             return payload
+
         parsed = cls._parse_tool_call(text)
         if parsed is None:
             if body is not None:
@@ -330,6 +376,7 @@ class OpenCodeBridge:
                     "code": exc.code,
                 }
             },
+            cacheable=True,
         )
 
     async def _do_upstream(self, body: dict[str, Any], auth_header: str | None) -> _CachedResult:
@@ -369,6 +416,9 @@ class OpenCodeBridge:
                 status=status,
                 headers=keep_headers,
                 payload=payload,
+                # A 429/401/5xx must remain retryable rather than poisoning the
+                # replay cache for the full TTL.
+                cacheable=status < 400,
             )
 
     async def _finalize_task(self, key: str, task: asyncio.Task[_CachedResult]) -> None:
@@ -384,10 +434,11 @@ class OpenCodeBridge:
             except asyncio.CancelledError:
                 return
             if exc is None:
-                self._cache[key] = task.result()
+                result = task.result()
+                if result.cacheable:
+                    self._cache[key] = result
 
     def _schedule_finalize(self, key: str, task: asyncio.Task[_CachedResult]) -> None:
-        # Done callbacks cannot await the lock, so schedule a tiny coroutine.
         asyncio.create_task(self._finalize_task(key, task))
 
     async def _get_result(
@@ -410,8 +461,8 @@ class OpenCodeBridge:
                 self._inflight[key] = task
                 task.add_done_callback(lambda done, k=key: self._schedule_finalize(k, done))
 
-        # Deliberate: cancellation/disconnect of one HTTP client must not cancel
-        # the logical ChatGPT turn shared by reconnects.
+        # Deliberate: cancelling/disconnecting one HTTP client must not cancel
+        # the shared logical ChatGPT turn. A retry joins the same task.
         return await asyncio.shield(task)
 
     @staticmethod
