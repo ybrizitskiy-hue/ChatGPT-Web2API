@@ -65,7 +65,7 @@ if (Test-Path $pyproject) {
 if ($LASTEXITCODE -ne 0) { throw "Could not install ChatGPT-Web2API." }
 
 $setupArgs = @(
-    "-m", "chatgpt_web2api.opencode_bridge", "setup",
+    "-m", "chatgpt_web2api.opencode_setup", "setup",
     "--non-interactive",
     "--upstream", $Upstream,
     "--bridge-url", $BridgeUrl,
