@@ -124,7 +124,7 @@ def parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--upstream", default=DEFAULT_UPSTREAM)
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8010)
-    serve_parser.add_argument("--cache-ttl", type=float, default=300)
+    serve_parser.add_argument("--cache-ttl", type=float, default=60)
     serve_parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
 
     setup_parser = sub.add_parser("setup", help="Configure Web2API and OpenCode")
