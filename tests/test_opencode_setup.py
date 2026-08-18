@@ -134,3 +134,44 @@ def test_launchers_call_setup_module_and_support_remote_services(tmp_path, monke
         assert "chatgpt_web2api.opencode_setup" in text
         assert "--no-core" in text
         assert "--no-bridge" in text
+
+
+def test_setup_command_writes_local_configs_and_launchers(tmp_path, monkeypatch):
+    from chatgpt_web2api import opencode_setup
+
+    state = tmp_path / "state"
+    core = state / "config.json"
+    key_file = state / "key"
+    opencode = tmp_path / "opencode.json"
+    monkeypatch.setattr(opencode_setup, "state_dir", lambda: state)
+    monkeypatch.setattr(opencode_setup, "model_catalog", lambda upstream, key: ["auto"])
+    args = parser().parse_args(
+        [
+            "setup",
+            "--non-interactive",
+            "--api-key",
+            "local-test-key",
+            "--key-file",
+            str(key_file),
+            "--core-config",
+            str(core),
+            "--opencode-config",
+            str(opencode),
+            "--model",
+            "auto",
+            "--set-default",
+        ]
+    )
+    assert opencode_setup.setup(args) == 0
+    assert key_file.read_text(encoding="utf-8").strip() == "local-test-key"
+    assert "local-test-key" in json.loads(core.read_text(encoding="utf-8"))["api_keys"]
+    config = json.loads(opencode.read_text(encoding="utf-8"))
+    assert config["model"] == "chatgpt-web/auto"
+    assert (state / "start-opencode-web2api.cmd").exists()
+    assert (state / "start-opencode-web2api.sh").exists()
+
+
+def test_remote_bridge_base_keeps_path_prefix():
+    from chatgpt_web2api.opencode_setup_runtime import bridge_base_url
+
+    assert bridge_base_url("https://example.test/proxy/v1") == "https://example.test/proxy"
