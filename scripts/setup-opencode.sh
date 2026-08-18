@@ -35,7 +35,7 @@ if [ -n "${W2A_API_KEY:-}" ]; then
   export W2A_OPENCODE_API_KEY=$W2A_API_KEY
 fi
 
-set -- -m chatgpt_web2api.opencode_bridge setup \
+set -- -m chatgpt_web2api.opencode_setup setup \
   --non-interactive \
   --upstream "$UPSTREAM" \
   --bridge-url "$BRIDGE_URL" \
