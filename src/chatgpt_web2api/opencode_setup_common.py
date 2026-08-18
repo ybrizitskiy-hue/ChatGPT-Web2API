@@ -19,6 +19,13 @@ DEFAULT_PROVIDER = "chatgpt-web"
 DEFAULT_UPSTREAM = "http://127.0.0.1:8080"
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:8010/v1"
 DEFAULT_TIMEOUT = 930
+# The upstream detector defaults (90s/120s after visible text stops changing)
+# are intentionally conservative for general browser automation. OpenCode tool
+# turns are tiny JSON envelopes, so waiting that long after visible output has
+# stopped makes the agent look frozen. The setup-managed instance uses a much
+# shorter post-content idle budget while keeping the long first-content budget
+# required by reasoning models.
+OPENCODE_STREAM_IDLE_TIMEOUT = 20.0
 
 
 def state_dir() -> Path:
@@ -142,7 +149,9 @@ def backup(path: Path) -> Path | None:
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -178,7 +187,9 @@ def is_loopback(value: str) -> bool:
     return urllib.parse.urlparse(value).hostname in {"127.0.0.1", "localhost", "::1"}
 
 
-def request_json(url: str, api_key: str | None, timeout: float = 5) -> tuple[int, dict[str, Any]]:
+def request_json(
+    url: str, api_key: str | None, timeout: float = 5
+) -> tuple[int, dict[str, Any]]:
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -199,12 +210,18 @@ def request_json(url: str, api_key: str | None, timeout: float = 5) -> tuple[int
 
 def model_catalog(upstream: str, api_key: str | None) -> list[str]:
     try:
-        status, payload = request_json(f"{normalize_url(upstream, v1=False)}/v1/models", api_key, 8)
+        status, payload = request_json(
+            f"{normalize_url(upstream, v1=False)}/v1/models", api_key, 8
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return []
     if status >= 400 or not isinstance(payload.get("data"), list):
         return []
-    return [item["id"] for item in payload["data"] if isinstance(item, dict) and isinstance(item.get("id"), str)]
+    return [
+        item["id"]
+        for item in payload["data"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    ]
 
 
 def choose_model(models: list[str]) -> str:
@@ -217,7 +234,10 @@ def choose_model(models: list[str]) -> str:
 
 def reasoning_model(model: str) -> bool:
     value = model.lower()
-    return any(marker in value for marker in ("sol", "thinking", "reasoning", "research", "o1", "o3", "o4", "5-5"))
+    return any(
+        marker in value
+        for marker in ("sol", "thinking", "reasoning", "research", "o1", "o3", "o4", "5-5")
+    )
 
 
 def project_config_path(project_dir: Path) -> Path:
@@ -233,6 +253,15 @@ def project_config_path(project_dir: Path) -> Path:
     return candidates[0]
 
 
+def _shorten_idle_budget(config: dict[str, Any], key: str) -> None:
+    current = config.get(key)
+    try:
+        current_value = float(current) if current is not None else OPENCODE_STREAM_IDLE_TIMEOUT
+    except (TypeError, ValueError):
+        current_value = OPENCODE_STREAM_IDLE_TIMEOUT
+    config[key] = min(current_value, OPENCODE_STREAM_IDLE_TIMEOUT)
+
+
 def configure_core(path: Path, api_key: str, upstream: str, model: str) -> Path | None:
     config = load_object(path)
     previous = backup(path)
@@ -245,14 +274,20 @@ def configure_core(path: Path, api_key: str, upstream: str, model: str) -> Path 
     if api_key not in keys:
         keys.append(api_key)
     config["api_keys"] = keys
-    config["request_timeout"] = max(int(config.get("request_timeout", 0) or 0), DEFAULT_TIMEOUT)
-    config["detector_hard_timeout_seconds"] = max(float(config.get("detector_hard_timeout_seconds", 0) or 0), 900)
+    config["request_timeout"] = max(
+        int(config.get("request_timeout", 0) or 0), DEFAULT_TIMEOUT
+    )
+    config["detector_hard_timeout_seconds"] = max(
+        float(config.get("detector_hard_timeout_seconds", 0) or 0), 900
+    )
     config["detector_reasoning_first_content_timeout_seconds"] = max(
         float(config.get("detector_reasoning_first_content_timeout_seconds", 0) or 0), 300
     )
-    config["detector_reasoning_stream_idle_timeout_seconds"] = max(
-        float(config.get("detector_reasoning_stream_idle_timeout_seconds", 0) or 0), 120
+    config["detector_default_first_content_timeout_seconds"] = max(
+        float(config.get("detector_default_first_content_timeout_seconds", 0) or 0), 90
     )
+    _shorten_idle_budget(config, "detector_reasoning_stream_idle_timeout_seconds")
+    _shorten_idle_budget(config, "detector_default_stream_idle_timeout_seconds")
     if model != "auto" and not config.get("default_model"):
         config["default_model"] = model
     write_json(path, config)
@@ -290,7 +325,11 @@ def configure_opencode(
             "chunkTimeout": 120000,
         }
     )
-    models[model] = {"name": model_name, "tool_call": True, "reasoning": reasoning_model(model)}
+    models[model] = {
+        "name": model_name,
+        "tool_call": True,
+        "reasoning": reasoning_model(model),
+    }
     provider.update(
         {
             "npm": "@ai-sdk/openai-compatible",
@@ -304,7 +343,11 @@ def configure_opencode(
     if set_default or not config.get("model"):
         config["model"] = f"{provider_id}/{model}"
     if safe_permissions and "permission" not in config:
-        config["permission"] = {"edit": "ask", "bash": "ask", "external_directory": "ask"}
+        config["permission"] = {
+            "edit": "ask",
+            "bash": "ask",
+            "external_directory": "ask",
+        }
     write_json(path, config)
     return previous
 
@@ -316,7 +359,14 @@ def self_command() -> list[str]:
 
 
 def core_command(config: Path) -> list[str]:
-    return [str(Path(sys.executable).resolve()), "-m", "chatgpt_web2api", "start", "--config", str(config)]
+    return [
+        str(Path(sys.executable).resolve()),
+        "-m",
+        "chatgpt_web2api",
+        "start",
+        "--config",
+        str(config),
+    ]
 
 
 def write_launchers(
@@ -351,7 +401,10 @@ def write_launchers(
         encoding="utf-8",
     )
     sh = directory / "start-opencode-web2api.sh"
-    sh.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(part) for part in command) + "\n", encoding="utf-8")
+    sh.write_text(
+        "#!/bin/sh\nexec " + " ".join(shlex.quote(part) for part in command) + "\n",
+        encoding="utf-8",
+    )
     try:
         sh.chmod(0o700)
     except OSError:
