@@ -82,9 +82,24 @@ class SessionOpenCodeBridge(AgenticOpenCodeBridge):
             "say so instead of using a native ChatGPT capability."
         )
 
+    @staticmethod
+    def _continuation_has_user_followup(body: dict[str, Any]) -> bool:
+        """Return True only for a real new user turn, never for a tool-result delta."""
+        return any(
+            isinstance(message, dict) and message.get("role") == "user"
+            for message in body.get("messages") or []
+        )
+
     @classmethod
     def _prepare_upstream_body(cls, body: dict[str, Any]) -> dict[str, Any]:
-        """Continuation turns send only their delta and do not repeat tool schemas."""
+        """Send only continuation delta; refresh tool protocol on new user follow-ups.
+
+        Tool-result turns stay minimal because the tool schema is already visible in
+        the ChatGPT conversation. A later user follow-up may have a different set of
+        OpenCode tools or a stronger ``tool_choice`` (notably GitHub requests forced
+        to ``required``), so that turn re-advertises the current tool protocol without
+        replaying the rest of OpenCode history or creating a new ChatGPT conversation.
+        """
         if not body.get(_CONTINUATION_MARKER):
             return super()._prepare_upstream_body(body)
 
@@ -106,6 +121,16 @@ class SessionOpenCodeBridge(AgenticOpenCodeBridge):
                 code="invalid_tool_choice",
                 status=400,
             )
+
+        if tools and mode != "none" and cls._continuation_has_user_followup(body):
+            upstream["messages"].insert(
+                0,
+                {
+                    "role": "system",
+                    "content": cls._tool_instructions(tools, body),
+                },
+            )
+
         upstream.pop("tools", None)
         upstream.pop("tool_choice", None)
         upstream.pop("parallel_tool_calls", None)
