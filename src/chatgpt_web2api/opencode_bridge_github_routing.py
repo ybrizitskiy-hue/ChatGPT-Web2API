@@ -2,16 +2,24 @@
 
 Keep public read-only GitHub work on OpenCode-native web tools when available,
 instead of making the model depend on a locally installed/authenticated ``gh``.
+For deterministic public reads, the bridge can synthesize the first OpenAI
+``webfetch`` tool call directly so ChatGPT never has to emulate tool selection.
 This layer does not touch the Web2API browser/CDP core or session affinity.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import re
+import time
+import urllib.parse
+import uuid
 from typing import Any
 
 from aiohttp import web
 
+from .opencode_bridge import _CachedResult
 from .opencode_bridge_exact_session import (
     ExactSessionOpenCodeBridge,
     _SESSION_CONTEXT,
@@ -26,6 +34,8 @@ from .opencode_bridge_runtime import (
     DEFAULT_UPSTREAM,
 )
 
+_LOG = logging.getLogger(__name__)
+
 _PUBLIC_GITHUB_URL_RE = re.compile(
     r"https?://(?:www\.)?(?:github\.com|api\.github\.com)/[^\s<>()]+",
     re.IGNORECASE,
@@ -38,10 +48,17 @@ _GITHUB_WRITE_RE = re.compile(
     r"прокоммент|одобри|закоммить|тег|релиз|форк)",
     re.IGNORECASE,
 )
+_LATEST_COMMIT_READ_RE = re.compile(
+    r"(?:\b(?:latest|last|newest|recent)\b.{0,48}\bcommit\b)"
+    r"|(?:\bcommit\b.{0,48}\b(?:message|sha|hash)\b)"
+    r"|(?:последн\w*.{0,48}коммит)"
+    r"|(?:коммит.{0,48}(?:сообщен|sha|хеш|hash))",
+    re.IGNORECASE,
+)
 
 
 class GitHubRoutingOpenCodeBridge(ExactSessionOpenCodeBridge):
-    """Prefer auth-free OpenCode webfetch for public read-only GitHub requests."""
+    """Route public GitHub reads through deterministic OpenCode web tools."""
 
     @classmethod
     def _latest_user_message_text(cls, body: dict[str, Any]) -> str:
@@ -49,6 +66,13 @@ class GitHubRoutingOpenCodeBridge(ExactSessionOpenCodeBridge):
             if isinstance(message, dict) and message.get("role") == "user":
                 return cls._content_text(message.get("content"))
         return ""
+
+    @classmethod
+    def _public_github_url(cls, body: dict[str, Any]) -> str | None:
+        match = _PUBLIC_GITHUB_URL_RE.search(cls._latest_user_message_text(body))
+        if not match:
+            return None
+        return match.group(0).rstrip(".,;:!?)]}'\"")
 
     @classmethod
     def _public_github_read_intent(cls, body: dict[str, Any]) -> bool:
@@ -87,6 +111,133 @@ class GitHubRoutingOpenCodeBridge(ExactSessionOpenCodeBridge):
         routed = dict(forced)
         routed["tool_choice"] = cls._named_tool_choice(preferred)
         return routed
+
+    @classmethod
+    def _webfetch_arguments(cls, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Build safe arguments for the OpenCode webfetch schema."""
+        source_url = cls._public_github_url(body)
+        if not source_url:
+            return None
+
+        text = cls._latest_user_message_text(body)
+        target_url = source_url
+        response_format = "text" if "api.github.com" in source_url.lower() else "markdown"
+
+        parsed = urllib.parse.urlparse(source_url)
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if (
+            parsed.netloc.lower() in {"github.com", "www.github.com"}
+            and len(path_parts) == 2
+            and _LATEST_COMMIT_READ_RE.search(text)
+        ):
+            owner = urllib.parse.quote(path_parts[0], safe="")
+            repo = urllib.parse.quote(path_parts[1].removesuffix(".git"), safe="")
+            target_url = f"https://api.github.com/repos/{owner}/{repo}/commits?per_page=1"
+            response_format = "text"
+
+        webfetch = next(
+            (
+                tool.get("function") or {}
+                for tool in cls._function_tools(body.get("tools") or [])
+                if (tool.get("function") or {}).get("name") == "webfetch"
+            ),
+            None,
+        )
+        if not isinstance(webfetch, dict):
+            return None
+
+        parameters = webfetch.get("parameters") or {}
+        properties = parameters.get("properties") if isinstance(parameters, dict) else {}
+        required = parameters.get("required") if isinstance(parameters, dict) else []
+        properties = properties if isinstance(properties, dict) else {}
+        required = required if isinstance(required, list) else []
+
+        arguments: dict[str, Any] = {"url": target_url}
+        if "format" in properties or "format" in required:
+            arguments["format"] = response_format
+        return arguments
+
+    @classmethod
+    def _synthetic_public_github_tool_call(
+        cls, body: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Return a deterministic first tool call only for a new public GitHub read turn."""
+        if cls._is_title_request(body):
+            return None
+        last = cls._last_non_system_message(body)
+        if not last or last.get("role") != "user":
+            return None
+        if not cls._public_github_read_intent(body):
+            return None
+
+        mode, named = cls._tool_choice(body)
+        if mode == "none" or (mode == "named" and named != "webfetch"):
+            return None
+        if "webfetch" not in cls._available_tool_names(body):
+            return None
+
+        arguments = cls._webfetch_arguments(body)
+        if arguments is None:
+            return None
+        return "webfetch", arguments
+
+    @classmethod
+    def _synthetic_tool_payload(
+        cls,
+        body: dict[str, Any],
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        call_id = f"call_{uuid.uuid4().hex[:24]}"
+        return {
+            "id": f"chatcmpl-local-tool-{uuid.uuid4().hex[:16]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": body.get("model", "auto"),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(
+                                        arguments,
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    async def _do_upstream(
+        self,
+        body: dict[str, Any],
+        auth_header: str | None,
+    ) -> _CachedResult:
+        synthetic = self._synthetic_public_github_tool_call(body)
+        if synthetic is not None:
+            name, arguments = synthetic
+            _LOG.info("Synthetic OpenCode tool call: %s %s", name, arguments.get("url", ""))
+            return _CachedResult(
+                expires_at=time.monotonic() + self.cache_ttl,
+                status=200,
+                headers={},
+                payload=self._synthetic_tool_payload(body, name, arguments),
+                cacheable=True,
+            )
+        return await super()._do_upstream(body, auth_header)
 
     @classmethod
     def _tool_instructions(cls, tools: list[dict[str, Any]], body: dict[str, Any]) -> str:
