@@ -1,14 +1,28 @@
+import json
+
 from chatgpt_web2api.opencode_bridge_github_routing import GitHubRoutingOpenCodeBridge
 from chatgpt_web2api.opencode_bridge_session import _CONTINUATION_MARKER
 
 
 def _tool(name: str) -> dict:
+    properties = {}
+    required = []
+    if name == "webfetch":
+        properties = {
+            "url": {"type": "string"},
+            "format": {"type": "string", "enum": ["text", "markdown", "html"]},
+        }
+        required = ["url"]
     return {
         "type": "function",
         "function": {
             "name": name,
             "description": f"{name} tool",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
         },
     }
 
@@ -93,3 +107,100 @@ def test_same_chat_github_followup_advertises_named_webfetch_policy() -> None:
     assert "webfetch" in system["content"]
     assert "Do NOT choose bash+gh" in system["content"]
     assert "ChatGPT-native" in system["content"]
+
+
+def test_latest_commit_read_synthesizes_webfetch_to_github_api() -> None:
+    body = _body(
+        "Inspect https://github.com/ybrizitskiy-hue/ChatGPT-Web2API and tell me the latest commit message.",
+        ["bash", "webfetch"],
+    )
+
+    plan = GitHubRoutingOpenCodeBridge._synthetic_public_github_tool_call(body)
+
+    assert plan is not None
+    name, arguments = plan
+    assert name == "webfetch"
+    assert arguments == {
+        "url": "https://api.github.com/repos/ybrizitskiy-hue/ChatGPT-Web2API/commits?per_page=1",
+        "format": "text",
+    }
+
+
+def test_generic_public_github_read_synthesizes_original_url() -> None:
+    body = _body(
+        "Read https://github.com/example/project/blob/main/README.md and summarize it.",
+        ["bash", "webfetch"],
+    )
+
+    plan = GitHubRoutingOpenCodeBridge._synthetic_public_github_tool_call(body)
+
+    assert plan == (
+        "webfetch",
+        {
+            "url": "https://github.com/example/project/blob/main/README.md",
+            "format": "markdown",
+        },
+    )
+
+
+def test_tool_result_turn_never_resynthesizes_webfetch() -> None:
+    body = _body(
+        "Inspect https://github.com/example/project and tell me the latest commit message.",
+        ["bash", "webfetch"],
+    )
+    body["messages"].extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_webfetch",
+                        "type": "function",
+                        "function": {
+                            "name": "webfetch",
+                            "arguments": '{"url":"https://api.github.com/repos/example/project/commits?per_page=1","format":"text"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_webfetch",
+                "content": '[{"commit":{"message":"latest message"}}]',
+            },
+        ]
+    )
+
+    assert GitHubRoutingOpenCodeBridge._synthetic_public_github_tool_call(body) is None
+
+
+def test_github_write_never_synthesizes_read_tool() -> None:
+    body = _body(
+        "Merge https://github.com/example/project/pull/42",
+        ["bash", "webfetch"],
+    )
+
+    assert GitHubRoutingOpenCodeBridge._synthetic_public_github_tool_call(body) is None
+
+
+def test_synthetic_payload_is_standard_openai_tool_call() -> None:
+    body = _body(
+        "Inspect https://github.com/example/project",
+        ["webfetch"],
+    )
+    payload = GitHubRoutingOpenCodeBridge._synthetic_tool_payload(
+        body,
+        "webfetch",
+        {"url": "https://github.com/example/project", "format": "markdown"},
+    )
+
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    call = choice["message"]["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["function"]["name"] == "webfetch"
+    assert json.loads(call["function"]["arguments"]) == {
+        "url": "https://github.com/example/project",
+        "format": "markdown",
+    }
