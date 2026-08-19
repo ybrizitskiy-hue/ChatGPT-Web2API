@@ -1,0 +1,27 @@
+ChatGPT-Web2API + OpenCode — START HERE
+========================================
+
+WINDOWS
+-------
+1. Double-click setup-opencode.cmd.
+2. The installer will install Git and Python 3.13 automatically if needed.
+3. It clones/updates the fork, creates an isolated Python environment, installs the bridge, generates the local service key, and configures OpenCode automatically.
+4. When the managed Chrome window opens, sign in to ChatGPT there. Do not paste passwords, MFA codes, cookies, or session tokens into the installer.
+5. Restart OpenCode and use provider/model chatgpt-web/auto, or select an exact live model from the model catalog.
+
+YOU DO NOT NEED AN OPENAI API KEY.
+You do not need to paste a local API key or base URL into OpenCode either. Setup writes both automatically.
+
+Main provider:       chatgpt-web        -> http://127.0.0.1:8010/v1 (tools enabled)
+Diagnostic baseline: chatgpt-web-direct -> http://127.0.0.1:8080/v1 (tools disabled)
+
+If something looks wrong, double-click run-opencode-diagnostics.cmd and send the resulting window/screenshot. The diagnostics do not print the local key.
+
+Live acceptance completed on Windows on 2026-08-19:
+- normal chat response returned to OpenCode
+- required tool-call wire probe
+- bash tool execution
+- bash -> read multi-turn loop
+- write/edit/read/delete file workflow with cleanup
+
+See ..\OPENCODE.md for full usage and troubleshooting.

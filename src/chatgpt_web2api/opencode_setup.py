@@ -81,8 +81,8 @@ def setup(args: argparse.Namespace) -> int:
     if local_core:
         core_backup = configure_core(core_path, api_key, upstream, model)
         # Older versions of our OpenCode installer changed Web2API's browser
-        # completion detector budgets.  Undo only the exact values we injected
-        # so the core again runs with its stock defaults.  User custom values
+        # completion detector budgets. Undo only the exact values we injected
+        # so the core again runs with its stock defaults. User custom values
         # that differ from ours are preserved.
         restore_stock_core_tuning(core_path)
     opencode_backup = configure_opencode(
@@ -95,16 +95,17 @@ def setup(args: argparse.Namespace) -> int:
         set_default=args.set_default,
         safe_permissions=not args.no_safe_permissions,
     )
-    # Always install a direct baseline beside the tools sidecar.  When setup is
-    # asked to set the default model, prefer the direct baseline until the
-    # sidecar has passed a live A/B test on this machine/account.
+    # Keep a direct provider beside the production tool sidecar as an A/B
+    # diagnostic route. The sidecar has passed live chat, bash, read,
+    # write/edit/read/cleanup and multi-turn tool-loop acceptance, so setup no
+    # longer makes the direct baseline the default.
     configure_direct_provider(
         opencode_path.expanduser(),
         upstream=upstream,
         key_file=key_file,
         model=model,
         model_name=model_name,
-        set_default=args.set_default,
+        set_default=False,
     )
     cmd, sh = write_launchers(
         state_dir(),
@@ -118,8 +119,8 @@ def setup(args: argparse.Namespace) -> int:
     print("OpenCode integration configured.")
     print(f"  OpenCode config: {opencode_path}")
     print(f"  API key file: {key_file}")
-    print(f"  Direct baseline: {DIRECT_PROVIDER}/{model}")
-    print(f"  Tools sidecar: {args.provider_id}/{model}")
+    print(f"  Tools provider: {args.provider_id}/{model}")
+    print(f"  Direct diagnostic baseline: {DIRECT_PROVIDER}/{model}")
     print(f"  Windows launcher: {cmd}")
     print(f"  macOS/Linux launcher: {sh}")
     if core_backup:

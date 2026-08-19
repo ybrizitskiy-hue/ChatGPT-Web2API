@@ -10,6 +10,9 @@ read, start with the [routing table](#which-doc-should-i-read) below.
 
 | I want to… | Read this first |
 |------------|-----------------|
+| **connect OpenCode to ChatGPT Web with local coding tools** | [`../OPENCODE.md`](../OPENCODE.md) → one-click install + live acceptance tests |
+| **hand setup/maintenance to Codex or another coding agent** | [opencode-handover.md](opencode-handover.md) |
+| **understand the OpenCode tools sidecar/reliability model** | [opencode-bridge.md](opencode-bridge.md) |
 | **try it locally for the first time** | [deployment.md](deployment.md) → Option 1 (pip install) |
 | **run it in Docker / headed Chrome in a container** | [deployment.md](deployment.md) → Docker section + [reverse-engineering-notes.md](reverse-engineering-notes.md) (anti-bot caveats) |
 | **share it with a non-technical user** | [deployment.md](deployment.md) → cookie-export / remote options |
@@ -24,10 +27,23 @@ read, start with the [routing table](#which-doc-should-i-read) below.
 
 ---
 
+## OpenCode integration
+
+| Doc | Purpose |
+|-----|---------|
+| [`../OPENCODE.md`](../OPENCODE.md) | **Install and use OpenCode with ChatGPT Web.** Windows one-click bootstrap, provider layout, automatic local key/baseURL configuration, models, doctor, smoke tests, troubleshooting, and known limitations. |
+| [opencode-bridge.md](opencode-bridge.md) | **Bridge design.** Tool protocol, sidecar/core separation, SSE buffering/keepalives, replay protection, false-denial recovery, and reliability boundaries. |
+| [opencode-handover.md](opencode-handover.md) | **Codex/agent handover.** Exact install/audit/acceptance sequence, safety constraints, regression rules, and final-report format. |
+
+The Windows OpenCode path was live-accepted on 2026-08-19 with normal chat,
+required tool-call translation, `bash`, sequential `bash -> read`, and a
+create/edit/read/delete cleanup loop through the real browser/account path.
+
+---
+
 ## Operating guides (Phase 6)
 
-These four are the day-to-day operator surface — start here for running a
-deployment.
+These are the day-to-day operator surface for the core REST/MCP deployment.
 
 | Doc | Purpose |
 |-----|---------|
@@ -77,16 +93,22 @@ individually here.
 ## Quick reference
 
 ```bash
-# Start / reconcile (the one command):
+# Core REST + MCP start / reconcile:
 chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222
 
-# Health:
+# OpenCode local stack:
+chatgpt-web2api-opencode start
+
+# OpenCode integration doctor:
+chatgpt-web2api-opencode doctor
+
+# Core health:
 curl -s http://localhost:8080/health
 
 # Do NOT use (no __main__ block):
 #   python -m chatgpt_web2api.ensure
 ```
 
-See [runbook.md](runbook.md) §1 (startup checklist) and §8 (post-deploy
-validation) for the full operational sequence, including the exact-output
-`"Reply with exactly: ok"` sanity send.
+For OpenCode, use [`../OPENCODE.md`](../OPENCODE.md). For core deployment
+operations, see [runbook.md](runbook.md) §1 (startup checklist) and §8
+(post-deploy validation).
