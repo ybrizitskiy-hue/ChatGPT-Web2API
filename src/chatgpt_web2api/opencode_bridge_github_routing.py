@@ -32,7 +32,8 @@ _PUBLIC_GITHUB_URL_RE = re.compile(
 )
 _GITHUB_WRITE_RE = re.compile(
     r"\b(push|merge|create|update|edit|delete|remove|close|reopen|comment|approve|"
-    r"commit|tag|release|fork)\b|"
+    r"tag|release|fork)\b|"
+    r"\bcommit\s+(?:this|these|the|my|our|changes?|files?)\b|"
     r"(запуш|пуш|смерж|см[её]рж|создай|обнови|измени|удали|закрой|переоткрой|"
     r"прокоммент|одобри|закоммить|тег|релиз|форк)",
     re.IGNORECASE,
