@@ -195,6 +195,8 @@ def test_setup_command_writes_local_configs_and_launchers(tmp_path, monkeypatch)
     assert "local-test-key" in json.loads(core.read_text(encoding="utf-8"))["api_keys"]
     config = json.loads(opencode.read_text(encoding="utf-8"))
     assert config["model"] == "chatgpt-web/auto"
+    assert config["provider"]["chatgpt-web"]["models"]["auto"]["tool_call"] is True
+    assert config["provider"]["chatgpt-web-direct"]["models"]["auto"]["tool_call"] is False
     assert (state / "start-opencode-web2api.cmd").exists()
     assert (state / "start-opencode-web2api.sh").exists()
 
