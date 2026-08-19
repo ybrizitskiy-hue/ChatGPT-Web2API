@@ -17,7 +17,8 @@ Two-tier correlation (peer-reviewed, conv ``6a482cfd``):
     - ``existing_conversation``: sent_text + pre-send backend node-id/time.
     - ``degraded_existing``: sent_text + wall-clock freshness (TOL=8s, lower-
       bound guard only — NOT a rapid-same-text discriminator).
-    - ``fresh_chat``: sent_text-only until conv_id resolves.
+    - ``fresh_chat``: sent_text first; if ChatGPT/backend rewrites the prompt,
+      the sole user node is authoritative because the chat was empty pre-send.
 
 Selector rules (ChatGPT round 4):
   - Resolve the user node first, then walk to its assistant response.
@@ -65,7 +66,7 @@ AnchorMode = Literal[
     "captured_id",          # primary: IdentityListener captured the UUID
     "existing_conversation",  # fallback: backend node-id/time anchor
     "degraded_existing",    # fallback: sent_text + wall-clock freshness
-    "fresh_chat",           # fallback: sent_text-only until conv_id resolves
+    "fresh_chat",           # fallback: sent_text/unique-user until conv_id resolves
 ]
 
 
@@ -298,7 +299,9 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
     id (or None) and ``reason`` explains the outcome for diagnostics.
 
     Primary path: exact match on ``captured_user_message_id``.
-    Fallback path: text match + freshness/anchor disambiguation.
+    Fallback path: text match + freshness/anchor disambiguation. For a truly
+    fresh chat whose identity capture was missed, a single user node is also a
+    safe anchor even when ChatGPT/backend rewrites the submitted prompt text.
     """
     nodes = mapping.get("nodes") or mapping.get("mapping") or {}
 
@@ -313,15 +316,30 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
         # ID was captured but not found in the projected window yet.
         return None, "id_not_yet_in_mapping"
 
-    # Fallback: text-based.
+    # Fallback: text-based. Also keep the complete user-node set so a fresh
+    # chat can safely fall back to its sole user node when backend text differs
+    # from the OpenCode payload (system/tool instructions may be normalized).
+    user_nodes = []
     matching = []
     for nid, node in nodes.items():
         if _node_role(node) != "user":
             continue
+        user_nodes.append((nid, node))
         if user_text_matches_sent(_node_text(node), anchor.sent_text):
             matching.append((nid, node))
 
     if not matching:
+        if anchor.mode == "fresh_chat":
+            # A fresh-chat anchor is created only when _current_conv_id was
+            # None before send. Therefore there cannot be a prior user turn in
+            # this conversation. Once the backend projection contains exactly
+            # one user node, that node is authoritative even if the backend/UI
+            # rewrote or normalized the submitted text. More than one user node
+            # is unexpected and stays fail-closed as ambiguous.
+            if len(user_nodes) == 1:
+                return user_nodes[0][0], "fresh_chat_unique_user"
+            if len(user_nodes) > 1:
+                return None, "ambiguous"
         return None, "no_text_match"
 
     # Filter by anchor (existing_conversation: newer/different than pre-send).
@@ -387,7 +405,8 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
         return None, "degraded_insufficient_evidence"
 
     if anchor.mode == "fresh_chat":
-        # Text-only; first/only match expected on a fresh chat.
+        # Text match is preferred when available. Multiple matches are
+        # unexpected on a fresh chat and remain fail-closed.
         if len(matching) > 1:
             return None, "ambiguous"
         return matching[0][0], "fresh_chat_text_match"
