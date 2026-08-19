@@ -234,7 +234,7 @@ def doctor(args: argparse.Namespace) -> int:
 def serve(args: argparse.Namespace) -> int:
     from aiohttp import web
 
-    from .opencode_bridge_session import create_app
+    from .opencode_bridge_exact_session import create_app
 
     api_key = read_key(args.api_key_file.expanduser())
     if not api_key:
